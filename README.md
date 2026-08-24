@@ -1,29 +1,30 @@
 # Solace Spring Boot Request/Reply
 
-Guaranteed-messaging request/reply over **Solace PubSub+** with **Spring Boot + JCSMP**, no
-Spring Cloud Stream layer. The worked example is train seat reservation.
+Request/reply over **Solace PubSub+** using **Spring Boot and JCSMP**, with guaranteed messaging
+and no Spring Cloud Stream layer. The worked example is train seat reservation.
 
-The API deliberately mirrors **Spring Kafka**: `ReplyingSolaceTemplate.sendAndReceive(...)` on
-the requestor, `@SolaceListener` + `@SendTo` on the replier. If you know
-`ReplyingKafkaTemplate`, you already know this.
+The API follows Spring Kafka conventions: `ReplyingSolaceTemplate.sendAndReceive(...)` on the
+requestor, `@SolaceListener` with `@SendTo` on the replier. If you have used
+`ReplyingKafkaTemplate`, most of this will look familiar.
 
-> Sample code, not an officially supported Solace product. Vendor it into your own package.
+> This is sample code, not an officially supported Solace product. If you adopt it, copy it into
+> your own package and take ownership of it.
 
 ---
 
 ## Quickstart
 
-Needs Docker and a JDK 17+.
+You need Docker and a JDK 17 or later.
 
 ```bash
-# 1. broker  (~60s to become healthy)
+# 1. Start a broker. It takes about a minute to become healthy.
 docker compose -f docker/docker-compose.yml up -d
 
-# 2. app
+# 2. Build and run the demo.
 ./mvnw -q -DskipTests install
 java -jar booking-demo/target/booking-demo-0.1.0-SNAPSHOT.jar
 
-# 3. book a berth
+# 3. Book a berth.
 curl -s -X POST http://localhost:8091/api/bookings \
   -H 'Content-Type: application/json' \
   -d '{"zone":"nr","trainNo":"12951","journeyDate":"2026-09-15",
@@ -39,13 +40,301 @@ curl -s -X POST http://localhost:8091/api/bookings \
 }
 ```
 
-**macOS:** port 55555 is reserved by the OS, so the broker publishes SMF on **55565**.
+On macOS, port 55555 is reserved by the operating system, so the broker publishes SMF on port
+55565 instead.
+
+---
+
+## How it works
+
+```mermaid
+flowchart TB
+    subgraph REQ["Requestor instances"]
+        direction LR
+        C0["client-0"]
+        C1["client-1"]
+    end
+
+    T1["Request topic<br/>cris/booking/seatReserve/request/v1/nr/12951"]
+    Q1[("q.cris.booking.seatReserve<br/>durable, non-exclusive")]
+
+    subgraph REP["Replier instances, competing for the same queue"]
+        direction LR
+        S1["replier-1"]
+        S2["replier-2"]
+        S3["replier-3"]
+    end
+
+    T2["Reply topic<br/>cris/booking/seatReserve/reply/v1/nr/12951/client-0"]
+    Q2[("q.cris.booking.reply.client-0<br/>exclusive, one consumer")]
+
+    C0 -- "1. publish PERSISTENT with a partition key" --> T1
+    C1 --> T1
+    T1 -- "2. topic subscription on the queue" --> Q1
+    Q1 -- "3. exactly one replier receives it" --> S1
+    Q1 --> S2
+    Q1 --> S3
+    S1 -- "4. publish the reply to the request's replyTo" --> T2
+    T2 -- "5. subscription with a wildcard level" --> Q2
+    Q2 -- "6. the waiting future completes" --> C0
+```
+
+Requests go to a single shared queue that many repliers consume from. Any replier can handle any
+booking, so the broker load-balances across them.
+
+Replies go to a separate queue for each requestor instance. The `CompletableFuture` waiting for a
+reply lives in the heap of one specific JVM, and no other instance can complete it, so replies have
+to be addressed rather than load-balanced.
+
+The request side deliberately uses a queue rather than a direct topic subscription. With a topic
+subscription, every replier instance would receive every request, run the handler, and publish a
+reply. In a booking system, one request would reserve a seat on each instance.
+
+### The two-stage future
+
+```java
+RequestReplyFuture<SeatReservation> f =
+        template.sendAndReceive(topic, key, req, SeatReservation.class);
+
+f.getSendFuture().get(2, SECONDS);      // the broker has spooled the request
+SeatReservation r = f.get(5, SECONDS);  // a replier answered
+```
+
+A request/reply call can fail in two independent ways. The request may never reach the broker, or it
+may reach the broker and go unanswered. A single future cannot report both, so both arrive as the
+same timeout and you cannot tell which half of the system to investigate.
+
+`getSendFuture()` resolves when the broker acknowledges that the request is spooled. It fails
+immediately if the publish is rejected, for example because the spool is full or a permission is
+missing. You can ignore it and get single-outcome behaviour, but it is there when the difference
+matters.
+
+You can see the distinction directly:
+
+```bash
+# The request is spooled but nothing replies. HTTP 504, and publishConfirmed is still true.
+curl -s -X POST localhost:8091/api/bookings -H 'Content-Type: application/json' \
+  -d '{"zone":"nr","trainNo":"12951","journeyDate":"2026-09-15","seatClass":"AC3",
+       "passengerName":"A Sharma","passengers":1,"simulate":"timeout"}' \
+  | jq '{error, publishConfirmed}'
+```
+
+### Guaranteed delivery introduces a risk of double booking
+
+Guaranteed messaging is at-least-once, not exactly-once. On a non-exclusive queue, an unacknowledged
+message is redelivered to another consumer. A replier that reserves a seat and then dies before
+acknowledging will see the same request again, and a naive handler would reserve a second seat.
+
+Two things prevent that:
+
+1. **Idempotent handling.** The correlation id is stored alongside the reservation, and a repeated
+   request returns the original reply instead of doing the work again. See
+   `SeatInventoryService.reserveOnce`. In a real service, the reservation and that record belong in
+   one database transaction with a unique constraint.
+2. **Acknowledge last.** The replier processes the request, publishes the reply, waits for the
+   broker to confirm the reply is spooled, and only then acknowledges the request. If it
+   acknowledged first, a crash in between would lose the request after the work had already
+   happened. The seat would be taken and the customer told the booking failed, with nothing left to
+   redeliver.
+
+---
+
+## Topic taxonomy and wildcards
+
+The topics follow the Solace `Domain/Noun/Verb/Version/Properties` template, with properties
+ordered from lowest to highest cardinality.
+
+```
+Request   cris/booking/seatReserve/request/v1/{zone}/{trainNo}
+Reply     cris/booking/seatReserve/reply/v1/{zone}/{trainNo}/{instanceId}
+```
+
+There are two wildcard characters. `*` matches exactly one level, and also works as a prefix inside
+a level, so `trn*` matches `trn123`. `>` matches one or more trailing levels, and only acts as a
+wildcard when it is the final level.
+
+| Subscription | What it gives you |
+|---|---|
+| `…/request/v1/>` | one pool of repliers handles every booking |
+| `…/request/v1/nr/>` | shard by zone, so this pool only handles Northern Railway |
+| `…/request/v1/*/12951` | tap a single train while investigating an incident |
+| `…/reply/v1/nr/*/client-0` | one instance's replies, which replaces a hostname selector |
+| `…/reply/v1/nr/12951/>` | every reply for one train, across all instances |
+
+### Replacing a JMS selector
+
+A common approach routes replies with a selector such as `hostname = '${HOSTNAME}'`. The broker
+evaluates that for every message, and the Solace topic architecture guidance recommends putting the
+discriminator in the topic instead.
+
+```diff
+- consumer:
+-   selector: "hostname = '${HOSTNAME}'"
++ # The instance id is a topic level, so the broker only sends what this instance asked for.
++ cris/booking/seatReserve/reply/v1/nr/*/client-0
+```
+
+Moving off selectors is also a prerequisite for partitioned queues. JCSMP defines the error subcode
+`SELECTORS_NOT_SUPPORTED_ON_PARTITIONED_QUEUE`, because the broker does not support both features on
+the same queue.
+
+### Why the reply topic includes the train number
+
+The replier only echoes the `replyTo` value from the request, so it never needs to know how the
+reply topic is structured. The requestor builds the concrete reply topic, because it already knows
+the train number, and subscribes once using a wildcard in that position.
+
+```
+subscription   cris/booking/seatReserve/reply/v1/nr/*/client-0
+reply-to       cris/booking/seatReserve/reply/v1/nr/12951/client-0
+```
+
+The train number is then visible in the topic, so you can analyse latency per train without parsing
+payloads. Configure it with `reply.per-request-placeholders` and a matching
+`per-request-placeholder-expressions` entry. If you list a placeholder without an expression, the
+level renders as `unknown`. The subscription still matches, so nothing breaks, but the information
+is lost.
+
+---
+
+## Configuration
+
+Connection settings use the `solace.java.*` namespace, which the official
+`solace-java-spring-boot-starter` already binds. Settings specific to this library live under
+`solace.request-reply.*`. See
+[booking-demo/src/main/resources/application.yml](booking-demo/src/main/resources/application.yml)
+for a complete example.
+
+Two settings are worth understanding before you deploy anything.
+
+| Setting | Default | Notes |
+|---|---|---|
+| `reply.endpoint-type` | `TEMPORARY` | Temporary queues need no provisioning and leave nothing behind, which makes a first run simple. Use `DURABLE` in production, because its subscription is a broker-side object and survives reconnects. |
+| `replier.partitioning.partition-count` | `0` (flat) | A flat queue keeps everything within JCSMP, needs no SEMP access, and retains selectors, queue browsing and replay. Setting it above zero serialises bookings for the same train, but requires SEMP, because JCSMP cannot express a partition count. |
+
+### The temporary queue hazard
+
+A temporary reply queue survives a disconnect for 60 seconds, or 180 seconds across a broker
+failover. After that the broker destroys it. When the client reconnects, the broker recreates the
+queue but does not restore its topic subscription.
+
+In that state the session is connected, the flow is bound, the queue exists, and nothing is logged.
+Every request times out until the process is restarted.
+
+The `recreate-on-reconnect` setting handles this by redoing the whole sequence after a reconnect, and
+`GET /api/diagnostics/reply-path` lets you check the current state. Using `DURABLE` avoids the
+problem entirely.
+
+### Provisioning modes
+
+`replier.provision.mode` accepts `CREATE_IF_MISSING` (the default), `VALIDATE` and `OFF`.
+
+Creating on startup is safe to leave enabled because configuration drift is reported rather than
+ignored. `FLAG_IGNORE_ALREADY_EXISTS` only suppresses the "already exists" error. If the queue exists
+with different properties, JCSMP raises `PropertyMismatchException`, which names the property that
+differs. This was verified against a live broker; see [spike/README.md](spike/README.md).
+
+---
+
+## Distributed tracing
+
+Tracing is disabled by default. Three conditions must all be true for it to become active:
+
+1. `solace.request-reply.tracing.enabled` is `true`,
+2. the OpenTelemetry API is on the classpath, and
+3. no `TracingContextBridge` bean is already defined.
+
+If any of them is false, the library uses a no-op bridge that captures nothing and allocates no
+wrappers. The OpenTelemetry dependencies are declared as optional, so a project that leaves tracing
+disabled does not carry them at all.
+
+```yaml
+solace:
+  request-reply:
+    tracing:
+      enabled: false           # set to true to activate
+      propagate-context: true  # carry W3C trace context between processes
+```
+
+`GET /api/diagnostics/endpoints` reports `configuredEnabled` and `active` separately, because
+tracing can be switched on and still be inactive if the libraries are missing.
+
+To enable it, add the dependencies and set the flag:
+
+```xml
+<dependency>
+  <groupId>io.opentelemetry</groupId>
+  <artifactId>opentelemetry-api</artifactId>
+</dependency>
+<dependency>
+  <!-- JCSMP has its own integration library, separate from the newer Java API's. -->
+  <groupId>com.solace</groupId>
+  <artifactId>solace-opentelemetry-jcsmp-integration</artifactId>
+</dependency>
+```
+
+### What tracing adds
+
+It does two separate things.
+
+**Capturing and restoring context** keeps a trace correctly parented. `future.complete()` runs its
+dependent stages on whichever thread completed it, and that thread holds the context of the reply.
+The span that should be the parent is the one that was active when the request was sent. The library
+stores the request's context in `PendingRequest` and restores it when completing the future.
+
+**Injecting and extracting context** carries the trace across processes, so the requestor and replier
+appear in one trace instead of two. This part needs the Solace integration library. If it is absent,
+the in-process behaviour above still works and the library logs a warning explaining what is missing.
+
+Broker-generated spans put both ends of a queue dwell measurement on the broker's own clock, which
+removes clock skew from the result. Those require a telemetry profile on the broker and an
+OpenTelemetry Collector configured with the Solace receiver. That setup is outside the scope of this
+sample.
+
+### Tracing and the handler executors
+
+The handler and the future completion both run on bounded executors rather than on the JCSMP dispatch
+thread. OpenTelemetry stores context in a thread local, and the Java agent propagates it across
+executors using a list of known executor class names. `ThreadPoolExecutor` is on that list; a custom
+`Executor` implementation is not.
+
+Both executors here are plain JDK thread pools, so propagation works without extra configuration. If
+you replace them with a custom `Executor`, context propagation will stop working silently.
+
+---
+
+## Coming from Spring Kafka
+
+| Spring Kafka | This library |
+|---|---|
+| `ReplyingKafkaTemplate` | `ReplyingSolaceTemplate` |
+| `sendAndReceive(...)` returning `RequestReplyFuture` | same names |
+| `getSendFuture()` returning `SendResult` | `getSendFuture()` returning `PublishResult` |
+| `ProducerRecord` key | `QUEUE_PARTITION_KEY` user property |
+| `@KafkaListener(topics = …)` | `@SolaceListener(queue = …, topics = …)` |
+| consumer `groupId` | `queue`, since a non-exclusive queue is the consumer group |
+| `@SendTo` | `@SendTo`, Spring's own annotation |
+| `KafkaHeaders.CORRELATION_ID` | `SolaceHeaders.CORRELATION_ID`, a native SMF field |
+| `KafkaHeaders.REPLY_PARTITION` | not needed, because each instance has its own reply topic |
+| `spring.kafka.*` | `solace.java.*` and `solace.request-reply.*` |
+
+### Differences that matter
+
+| Concept | Kafka behaviour | Solace behaviour |
+|---|---|---|
+| Ordering | guaranteed within a partition | a flat non-exclusive queue gives no ordering. `concurrency` adds parallelism, not ordering. The equivalent of a partition key is a partitioned queue. |
+| Provisioning | you provision topics | the reverse. Topics are just strings and need no setup, while queues are objects with permissions. |
+| Replay | messages are retained by time or size, and you can seek | a queue drains as messages are acknowledged. Reprocessing needs the separate Message Replay feature. |
+| Rebalancing | partitions are reassigned in a stop-the-world rebalance | messages are distributed one at a time across bound flows. Adding an instance takes effect immediately. |
+| Filtering | topic names are flat, so consumers filter in the application | topics are hierarchical and the broker filters per message. |
+| Dead letters | a client-side recoverer republishes to a `.DLT` topic | the broker moves messages to a dead message queue after the redelivery limit. |
+| Queue browsing | not applicable | not available on a partitioned queue. |
 
 ---
 
 ## Latency test
 
-One command, a histogram, then it exits. No Prometheus, no Grafana, nothing to install.
+A single command runs a test, prints a report, and exits. It needs no metrics backend.
 
 ```bash
 java -jar booking-demo/target/booking-demo-0.1.0-SNAPSHOT.jar \
@@ -85,248 +374,43 @@ ORDERING
   out-of-order                    0   in order
 ```
 
-Percentiles are **exact**, not interpolated from buckets. A bounded run can retain every sample —
-100,000 longs is 800 KB and sorts in ~10 ms — so histogram estimation buys nothing here.
+The percentiles are exact rather than estimated from histogram buckets. A test run is bounded, so
+every sample can be kept. 100,000 measurements is 800 KB and sorts in about ten milliseconds.
 
-The **SEGMENTS** block is what makes it actionable. `p99 = 24.6 ms` is a fact; *13 ms of it was
-queue dwell* says add repliers, whereas the same figure in `handler` would say look at the
-database.
+The segment breakdown is the part that tells you what to do next. A p99 of 24.6 ms on its own does
+not say much. Knowing that 13 ms of it was queue dwell suggests adding replier instances, whereas the
+same figure under `handler` would point at the database.
 
-**Read the closed-loop caveat.** With bounded in-flight requests, a slowdown makes the generator
-issue *fewer* requests, so slow periods are under-sampled and the tail flatters reality. That
-measures **service time at a concurrency**, not latency at an arrival rate. Use
-`--loadtest.mode=OPEN_LOOP --loadtest.rate=500` for the latter. The report always prints which
-mode produced it.
+Buckets are on a log scale, doubling each row, because latency distributions have long tails and
+linear buckets put almost everything in one row.
 
----
+### Closed loop and open loop
 
-## Topic taxonomy, and what wildcards buy you
+The default mode keeps a fixed number of requests in flight and waits for each reply. When the system
+slows down, the generator sends fewer requests, so slow periods are under-sampled and the tail looks
+better than it really is. This measures service time at a given concurrency, not latency at a given
+arrival rate.
 
-Following Solace's `Domain/Noun/Verb/Version/Properties` template, properties ordered by
-ascending cardinality:
-
-```
-Request   cris/booking/seatReserve/request/v1/{zone}/{trainNo}
-Reply     cris/booking/seatReserve/reply/v1/{zone}/{trainNo}/{instanceId}
-```
-
-`*` matches exactly one level (and also works as a prefix within a level: `trn*`).
-`>` matches one or more trailing levels, and is only a wildcard as the final level.
-
-| Subscription | Purpose |
-|---|---|
-| `…/request/v1/>` | one replier pool takes every booking |
-| `…/request/v1/nr/>` | shard by zone — Northern Railway only |
-| `…/request/v1/*/12951` | ops taps one train during an incident |
-| `…/reply/v1/nr/*/client-0` | **this instance's replies — replaces a hostname selector** |
-| `…/reply/v1/nr/12951/>` | every reply for one train, across all instances |
-
-### If you are replacing a JMS selector
-
-A common pattern routes replies with `selector: "hostname = '${HOSTNAME}'"`. Solace evaluates
-that **per message on the broker**, and the topic-architecture guidance lists message-property
-filtering as an anti-pattern: put the discriminator in the topic instead.
-
-```diff
-- consumer:
--   selector: "hostname = '${HOSTNAME}'"        # broker filters every message
-+ # the instance id IS a topic level, so the broker never sends what you did not ask for
-+ cris/booking/seatReserve/reply/v1/nr/*/client-0
-```
-
-It is also a **hard prerequisite** for partitioned queues: JCSMP carries
-`SELECTORS_NOT_SUPPORTED_ON_PARTITIONED_QUEUE` (subcode 99). The two features are mutually
-exclusive at the broker.
-
-### Reply topics carry request levels
-
-`{trainNo}` appears in the reply topic even though the replier only echoes `replyTo` verbatim.
-The *requestor* builds the concrete reply-to — it already knows the train — and subscribes once
-with `*` at that position:
-
-```
-subscription   cris/booking/seatReserve/reply/v1/nr/*/client-0
-reply-to       cris/booking/seatReserve/reply/v1/nr/12951/client-0
-```
-
-Zero coupling added, and per-train latency analysis needs no payload parsing. Configure with
-`reply.per-request-placeholders` plus a `per-request-placeholder-expressions` entry — without the
-expression the level renders as `unknown`, which still matches but tells you nothing.
-
----
-
-## Architecture in one paragraph
-
-Requests go to **one shared non-exclusive queue** that many repliers compete over. Replies go to
-**a queue per requestor instance**, because the `CompletableFuture` awaiting a reply lives in one
-JVM's heap and no other instance can complete it. Both legs are PERSISTENT.
-
-That asymmetry is the design. A direct topic subscription on the replier side would fan out —
-every instance receiving, and acting on, every request. For bookings that means one request
-reserving N seats.
-
-### The two-stage future
-
-```java
-RequestReplyFuture<SeatReservation> f = template.sendAndReceive(topic, key, req, SeatReservation.class);
-
-f.getSendFuture().get(2, SECONDS);   // the broker has SPOOLED the request
-SeatReservation r = f.get(5, SECONDS);  // somebody answered
-```
-
-A request/reply call has two independent failure points and one future cannot express both.
-Collapse them and "the broker rejected my publish" is indistinguishable from "the replier is
-down" — both arrive as the same timeout, pointing at the wrong half of the system.
+For the latter, use open loop mode, which sends at a fixed rate regardless of replies:
 
 ```bash
-# proves it: the request was spooled, nobody answered -> 504 with publishConfirmed=true
-curl -s -X POST localhost:8091/api/bookings -H 'Content-Type: application/json' \
-  -d '{...,"simulate":"timeout"}' | jq '{error, publishConfirmed}'
+--loadtest.mode=OPEN_LOOP --loadtest.rate=500
 ```
 
-### Guaranteed delivery introduces a double-booking risk
-
-At-least-once, not exactly-once. On a non-exclusive queue an unacknowledged message is
-redelivered to another consumer, so a replier that reserves a seat and dies before acknowledging
-will see the same request again. Two things prevent a second reservation:
-
-1. **Idempotent receiver** — the correlation id is stored with the reservation; a repeat returns
-   the original reply. See `SeatInventoryService.reserveOnce`.
-2. **Acknowledge last** — process, publish the reply, wait for the broker to confirm it,
-   *then* ack. Acking first loses the request if the process dies in between: the seat is taken
-   and the customer is told it failed, with nothing to redeliver.
-
----
-
-## Configuration
-
-Connection settings use `solace.java.*`, the namespace the official
-`solace-java-spring-boot-starter` already binds — nothing is reinvented. Pattern behaviour lives
-under `solace.request-reply.*`. See [booking-demo/src/main/resources/application.yml](booking-demo/src/main/resources/application.yml).
-
-The two switches worth knowing:
-
-| Setting | Default | Why |
-|---|---|---|
-| `reply.endpoint-type` | `TEMPORARY` | No provisioning, nothing to clean up. `DURABLE` for production: its subscription is a broker-side object and survives reconnects outright. |
-| `replier.partitioning.partition-count` | `0` (flat) | Flat keeps everything in JCSMP with no SEMP and no loss of selectors, browsing or replay. Above 0 serialises same-train bookings — but needs SEMP, because JCSMP cannot express a partition count at any version. |
-
-### The temporary-queue hazard
-
-A temporary reply queue survives a disconnect for 60 s (180 s across an HA failover), then is
-destroyed. On reconnect the broker recreates it **without its topic subscription**: session up,
-flow bound, nothing logged, and every request times out for ever.
-
-`recreate-on-reconnect` redoes the whole sequence, and `/api/diagnostics/reply-path` turns that
-state into an answer rather than a mystery. Use `DURABLE` in production and this cannot happen.
-
-### Provisioning modes
-
-`CREATE_IF_MISSING` (default), `VALIDATE`, `OFF`. Safe to ship enabled because drift is **loud**:
-`FLAG_IGNORE_ALREADY_EXISTS` suppresses only "already exists", while a queue whose properties
-differ raises `PropertyMismatchException` naming the offending property. Verified against a live
-broker — see [spike/README.md](spike/README.md).
-
----
-
-## Distributed tracing (optional, off by default)
-
-Disabled unless you ask for it, and inert even then if the OpenTelemetry libraries are absent —
-so a customer who wants nothing to do with tracing changes no configuration and carries no
-dependency.
-
-```yaml
-solace:
-  request-reply:
-    tracing:
-      enabled: false          # default. true activates it
-      propagate-context: true # carry W3C trace context between processes
-```
-
-Three conditions must all hold for it to activate: the flag is true, the OpenTelemetry API is on
-the classpath, and no `TracingContextBridge` bean is already defined. Fail any one and the library
-uses a no-op bridge that captures nothing and wraps nothing.
-
-`GET /api/diagnostics/endpoints` reports both `configuredEnabled` and `active`, which are
-deliberately separate — tracing can be switched on and still be inert.
-
-To turn it on, add the dependencies and flip the flag:
-
-```xml
-<dependency>
-  <groupId>io.opentelemetry</groupId><artifactId>opentelemetry-api</artifactId>
-</dependency>
-<dependency>
-  <!-- JCSMP has its OWN integration, distinct from the newer Java API's -->
-  <groupId>com.solace</groupId><artifactId>solace-opentelemetry-jcsmp-integration</artifactId>
-</dependency>
-```
-
-### What it does that metrics cannot
-
-Two different jobs, and the first is easy to overlook:
-
-- **Capture and restore** fixes *parent attribution*. `future.complete()` runs its dependents on
-  the thread that completed it, holding the **reply's** context — but the span that should parent
-  the continuation is the one active when the request was issued. Without this the trace is
-  connected and wrongly parented, which is harder to spot than a broken one. The request's context
-  is stored in `PendingRequest` and restored on completion.
-- **Inject and extract** carries trace context in the message, so requestor and replier appear in
-  one trace rather than two.
-
-Cross-process propagation needs the Solace integration jar; without it the in-process half still
-works and a warning explains what is missing. Broker-side spans (which put both ends of a queue
-dwell on the *broker's* clock, eliminating clock skew) additionally need a telemetry profile on the
-broker and an OpenTelemetry Collector with the Solace receiver.
-
-### One interaction worth knowing
-
-This design moves the handler and future completion onto bounded executors, off the JCSMP dispatch
-thread. OpenTelemetry context lives in a thread-local, and the Java agent propagates it across
-executors by an **exact class-name allowlist** — `ThreadPoolExecutor` is on it, a custom
-`Executor` is not. Both pools here are therefore plain JDK pools: the ordinary choice is also the
-one that keeps traces whole. Substituting a custom `Executor` would silently break propagation.
-
----
-
-## Coming from Spring Kafka
-
-| Spring Kafka | Here |
-|---|---|
-| `ReplyingKafkaTemplate` | `ReplyingSolaceTemplate` |
-| `sendAndReceive(...)` → `RequestReplyFuture` | same names |
-| `getSendFuture()` → `SendResult` | `getSendFuture()` → `PublishResult` |
-| `ProducerRecord` **key** | `QUEUE_PARTITION_KEY` user property |
-| `@KafkaListener(topics=…)` | `@SolaceListener(queue=…, topics=…)` |
-| consumer `groupId` | `queue` — a non-exclusive queue **is** the consumer group |
-| `@SendTo` | `@SendTo` — Spring's own annotation, reused |
-| `KafkaHeaders.CORRELATION_ID` | `SolaceHeaders.CORRELATION_ID` (a *native* SMF field) |
-| `KafkaHeaders.REPLY_PARTITION` | not needed — per-instance reply topic replaces it |
-| `spring.kafka.*` | `solace.java.*` + `solace.request-reply.*` |
-
-### Where the mental model breaks
-
-| Concept | Kafka expectation | Solace reality |
-|---|---|---|
-| **Ordering** | guaranteed within a partition | a flat non-exclusive queue guarantees **none**. `concurrency` buys parallelism, not ordering. A partitioned queue is the analogue of a partition key. |
-| Provisioning | you provision *topics* | inverted — topics are just strings; **queues** are objects with permissions |
-| Replay | retained by time/size, seek to an offset | a queue **drains on ack**. Reprocessing needs the separate Message Replay feature. |
-| Rebalancing | stop-the-world partition reassignment | per-message round robin. Adding a pod takes effect immediately, no rebalance storm, no partition-count ceiling on consumers. |
-| Filtering | flat topic names, filter in-app | hierarchical topics filter **per message at the broker**. No Kafka equivalent. |
-| Dead letters | client-side recoverer to `<topic>.DLT` | broker-side DMQ + max-redelivery, which keeps working when the consumer is what is broken |
-| Queue browsing | n/a | **unavailable** on a partitioned queue (subcode 98) |
+The report always states which mode produced it.
 
 ---
 
 ## Endpoints
 
-| Endpoint | What |
+| Endpoint | Purpose |
 |---|---|
-| `POST /api/bookings` | one reservation, with latency breakdown |
-| `POST /api/bookings?…simulate=` | `timeout`, `remote-error`, `slow-handler` — reproduce each failure mode |
-| `GET /api/diagnostics/endpoints` | what was actually provisioned, not what was configured |
-| `GET /api/diagnostics/reply-path` | is this instance's reply path really bound and subscribed |
-| `POST /api/latency/start` · `POST /api/latency/report` | exact percentiles over ad-hoc traffic |
+| `POST /api/bookings` | one reservation, with a latency breakdown |
+| `POST /api/bookings` with `"simulate"` | `timeout`, `remote-error` or `slow-handler`, to reproduce each failure mode |
+| `POST /api/bookings/replay?correlationId=…` | resend a request under a chosen correlation id, to check idempotency |
+| `GET /api/diagnostics/endpoints` | what was actually provisioned, rather than what was configured |
+| `GET /api/diagnostics/reply-path` | whether this instance's reply path is bound and subscribed |
+| `POST /api/latency/start` and `POST /api/latency/report` | exact percentiles over ad-hoc traffic |
 | `GET /actuator/health` | session and endpoint state |
 
 ---
@@ -334,40 +418,49 @@ one that keeps traces whole. Substituting a custom `Executor` would silently bre
 ## Tests
 
 ```bash
-./mvnw test        # spins up a broker via Testcontainers
+./mvnw test        # starts a broker with Testcontainers
 ```
 
-13 integration tests against a real broker. They exist because the properties that matter here are
-properties of the *broker interaction*, and none of them can be caught by a test that mocks it.
+Thirteen integration tests run against a real broker. The behaviour that matters here belongs to the
+interaction with the broker, so a test that mocked it would not catch the problems these are written
+to catch.
 
-| Test | Asserts |
+| Test | What it checks |
 |---|---|
-| `RequestReplyIntegrationTest` | round trip; the send future resolving independently of the reply; **one request doing work exactly once despite three competing flows**; a replayed correlation id not repeating the work; 60 concurrent requests correlated independently; timeout eviction leaving nothing pending |
-| `ReplyPathReconnectIntegrationTest` | replies still arrive after the connection is **severed from outside** via SEMP. The single most valuable test here: without re-subscription the queue would exist, the flow would be bound, nothing would log, and every request would time out for ever |
-| `ProvisionDriftIntegrationTest` | identical re-provision is idempotent; drifted properties raise `PropertyMismatchException`; the ignore flag suppresses only "already exists". This is what makes `CREATE_IF_MISSING` safe as a default |
-| `PartitionedQueueIntegrationTest` | SEMP creates a partitioned queue; a resize is refused unless explicitly allowed, because it deletes messages; a clear error when SEMP is unconfigured |
-| `TracingToggleIntegrationTest` | tracing genuinely off by default, genuinely on when configured |
+| `RequestReplyIntegrationTest` | a round trip; the send future resolving independently of the reply; one request producing exactly one unit of work despite three competing flows; a replayed correlation id not repeating the work; 60 concurrent requests correlated correctly; a timed-out request being evicted |
+| `ReplyPathReconnectIntegrationTest` | replies still arrive after the connection is cut from outside using SEMP. Without re-subscription the queue would exist, the flow would be bound, nothing would be logged, and every request would time out. |
+| `ProvisionDriftIntegrationTest` | re-provisioning with identical properties is a no-op; differing properties raise `PropertyMismatchException`; the ignore flag only suppresses "already exists" |
+| `PartitionedQueueIntegrationTest` | SEMP creates a partitioned queue; resizing is refused unless explicitly allowed, because a decrease deletes messages; a clear error when SEMP is not configured |
+| `TracingToggleIntegrationTest` | tracing is off by default and active when configured |
 
-Note the Testcontainers setup uses `GenericContainer` rather than the Solace module: the module
-rejects `default` as a username and does not set `container=docker` or a large enough shared-memory
-size, without which this image fails platform detection and exits.
+The tests use `GenericContainer` rather than the Testcontainers Solace module. The module rejects
+`default` as a client username, and does not set `container=docker` or a large enough shared memory
+size. Without those two settings this broker image fails its platform check and exits. Readiness is
+determined by a successful client login, because the management API starts answering well before the
+message VPN accepts connections.
+
+If your Docker host is already running other brokers, the suite may time out waiting for its own
+container to become healthy.
+
+---
 
 ## Layout
 
 ```
 solace-request-reply-core/     the reusable library
-  api/         ReplyingSolaceTemplate · RequestReplyFuture · @SolaceListener · SolaceHeaders
-  core/        template · correlation store · timeout reaper · codec
-  endpoint/    reply endpoints (temporary/durable) · request-queue provisioner · SEMP client
-  transport/   session · persistent publisher + ack correlation · flow consumer
+  api/         ReplyingSolaceTemplate, RequestReplyFuture, @SolaceListener, SolaceHeaders
+  core/        template, correlation store, timeout reaper, payload codec
+  endpoint/    reply endpoints, request queue provisioner, SEMP client
+  transport/   session, publisher with acknowledgement handling, flow consumer
   listener/    @SolaceListener discovery and container
-  latency/     six-segment samples · exact percentiles · histogram renderer
+  latency/     segment measurement, exact percentiles, histogram rendering
+  tracing/     optional OpenTelemetry bridge
 
 booking-demo/                  the runnable sample
 docker/                        local broker
-spike/                         the provision-drift experiment and its result
+spike/                         the provisioning experiment and its result
 ```
 
 ## Licence
 
-Apache-2.0.
+Apache 2.0.
