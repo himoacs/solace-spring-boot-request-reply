@@ -1,0 +1,12 @@
+{
+  "_comment": "Copy to config.json and fill in. config.json is gitignored so credentials never reach the repo.",
+  "host": "tcps://your-host.messaging.solace.cloud:55443",
+  "msgVpn": "your-vpn",
+  "clientUsername": "your-user",
+  "clientPassword": "your-password",
+
+  "_semp_comment": "Only needed when partition-count is above 0. Management credentials, not messaging ones.",
+  "sempUrl": "https://your-host.messaging.solace.cloud:943",
+  "sempUsername": "",
+  "sempPassword": ""
+}

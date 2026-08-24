@@ -70,6 +70,11 @@ public class DefaultReplyingSolaceTemplate implements ReplyingSolaceTemplate, Au
     private final Map<String, Expression> replyPlaceholderExpressions = new java.util.LinkedHashMap<>();
 
     private volatile FlowConsumer replyFlow;
+    /** correlation ids of in-flight canary probes, so replies to them are not treated as strays. */
+    private final Map<String, CompletableFuture<Void>> canaryWaiters =
+            new java.util.concurrent.ConcurrentHashMap<>();
+    private volatile boolean replyPathVerified;
+    private volatile String replyPathDetail = "not yet verified";
 
     public DefaultReplyingSolaceTemplate(SolaceSession session,
                                          ReplyEndpoint replyEndpoint,
@@ -107,6 +112,11 @@ public class DefaultReplyingSolaceTemplate implements ReplyingSolaceTemplate, Au
         bindReplyFlow();
         reaper.start();
         session.onReconnect(this::onReconnect);
+        if (props.getReply().isCanaryOnReconnect()) {
+            // Also run it once at startup: a misconfigured topic pattern fails here rather than
+            // on the first real booking.
+            verifyReplyPath();
+        }
         log.info("Request/reply template ready. replyTopic={} subscription={}",
                 replyEndpoint.replyTopic(Map.of()), replyEndpoint.subscription());
     }
@@ -133,10 +143,59 @@ public class DefaultReplyingSolaceTemplate implements ReplyingSolaceTemplate, Au
             bindReplyFlow();
             log.info("Reply path re-established after reconnect");
         } catch (RuntimeException ex) {
+            replyPathVerified = false;
+            replyPathDetail = "could not be re-established: " + ex.getMessage();
             log.error("Reply path could not be re-established; this instance can no longer "
                     + "receive replies and should be considered unhealthy", ex);
+            return;
+        }
+        if (props.getReply().isCanaryOnReconnect()) {
+            verifyReplyPath();
         }
     }
+
+    /**
+     * Sends a probe to this instance's own reply topic and waits for it to come back.
+     *
+     * <p>Re-establishing the endpoint can appear to succeed while the reply path is still broken.
+     * A temporary queue recreated after its linger window has no topic subscription, and in that
+     * state the session is connected, the flow is bound and nothing is logged, but no reply can
+     * ever arrive. Only a message that actually completes the round trip proves otherwise.
+     *
+     * @return true if the probe returned within the configured timeout
+     */
+    public boolean verifyReplyPath() {
+        String id = "canary-" + UUID.randomUUID();
+        CompletableFuture<Void> waiter = new CompletableFuture<>();
+        canaryWaiters.put(id, waiter);
+        String topic = replyEndpoint.replyTopic(Map.of());
+        try {
+            RequestReplyMessage probe = new RequestReplyMessage(new byte[0]);
+            probe.setCorrelationId(id);
+            publisher.publish(topic, probe, null, props.getReply().getCanaryTimeout().toMillis());
+            waiter.get(props.getReply().getCanaryTimeout().toMillis(),
+                    java.util.concurrent.TimeUnit.MILLISECONDS);
+            replyPathVerified = true;
+            replyPathDetail = "verified by a round-trip probe";
+            log.info("Reply path verified: a probe published to '{}' came back", topic);
+            return true;
+        } catch (Exception ex) {
+            replyPathVerified = false;
+            replyPathDetail = "a probe published to '" + topic + "' did not return within "
+                    + props.getReply().getCanaryTimeout();
+            log.error("Reply path verification FAILED. {}. Replies cannot reach this instance, so "
+                    + "every request will time out. This is the state a temporary reply queue "
+                    + "enters when it is recreated without its subscription.", replyPathDetail);
+            return false;
+        } finally {
+            canaryWaiters.remove(id);
+        }
+    }
+
+    /** Whether the last verification succeeded. Reported by the health indicator. */
+    public boolean isReplyPathVerified() { return replyPathVerified; }
+
+    public String replyPathDetail() { return replyPathDetail; }
 
     @Override
     public boolean waitForReplyEndpoint(Duration timeout) {
@@ -272,6 +331,14 @@ public class DefaultReplyingSolaceTemplate implements ReplyingSolaceTemplate, Au
         long dispatchDelayNanos = 0L;
         RequestReplyMessage reply = InboundMessage.toModel(msg);
         String correlationId = reply.getCorrelationId();
+
+        // Canary probes are not real requests, so they are never in the correlation store and
+        // would otherwise be logged as strays.
+        CompletableFuture<Void> canary = canaryWaiters.remove(correlationId);
+        if (canary != null) {
+            canary.complete(null);
+            return;
+        }
 
         store.remove(correlationId).ifPresentOrElse(pending -> {
             long total = System.nanoTime() - pending.getStartNanos();

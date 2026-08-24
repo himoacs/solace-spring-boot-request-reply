@@ -173,17 +173,55 @@ is lost.
 ## Configuration
 
 Connection settings use the `solace.java.*` namespace, which the official
-`solace-java-spring-boot-starter` already binds. Settings specific to this library live under
-`solace.request-reply.*`. See
-[booking-demo/src/main/resources/application.yml](booking-demo/src/main/resources/application.yml)
-for a complete example.
+`solace-java-spring-boot-starter` already binds. This library adds nothing there. Its own settings
+live under `solace.request-reply.*`.
 
-Two settings are worth understanding before you deploy anything.
+There are three places to look, depending on what you need:
 
-| Setting | Default | Notes |
+| File | What it is |
+|---|---|
+| [docs/configuration-reference.yml](docs/configuration-reference.yml) | Every property the library reads, with its default and an explanation. Start here. |
+| [booking-demo/src/main/resources/application.yml](booking-demo/src/main/resources/application.yml) | A working configuration with real values, used by the demo. |
+| `docs/config.json.example` | Template for broker credentials. Copy to `config.json`, which is gitignored. |
+
+### A minimal configuration
+
+This is enough to send and receive:
+
+```yaml
+solace:
+  java:
+    host: tcp://localhost:55565
+    msg-vpn: default
+    client-username: default
+    client-password: default
+
+  request-reply:
+    request:
+      timeout: 5s
+    reply:
+      topic-pattern: "my/service/reply/v1/{instanceId}"
+      queue-name-pattern: "q.my.service.reply.{instanceId}"
+    replier:
+      queue: q.my.service.requests
+      topics:
+        - "my/service/request/v1/>"
+```
+
+Everything else has a default. The defaults are chosen so that a first run against a fresh broker
+works without any provisioning: the reply endpoint is temporary, and the request queue is created
+if it does not exist.
+
+### The settings worth deciding deliberately
+
+| Setting | Default | Why it matters |
 |---|---|---|
-| `reply.endpoint-type` | `TEMPORARY` | Temporary queues need no provisioning and leave nothing behind, which makes a first run simple. Use `DURABLE` in production, because its subscription is a broker-side object and survives reconnects. |
-| `replier.partitioning.partition-count` | `0` (flat) | A flat queue keeps everything within JCSMP, needs no SEMP access, and retains selectors, queue browsing and replay. Setting it above zero serialises bookings for the same train, but requires SEMP, because JCSMP cannot express a partition count. |
+| `reply.endpoint-type` | `TEMPORARY` | Temporary queues need no provisioning and leave nothing behind. Use `DURABLE` in production, because its subscription is a broker-side object and survives reconnects. |
+| `replier.partitioning.partition-count` | `0` (flat) | A flat queue needs no SEMP access and keeps selectors, queue browsing and replay, but gives no ordering. Above zero serialises requests that share a partition key. |
+| `request.ttl-matches-timeout` | `true` | Stops a replier acting on a request after the requestor has given up. Turning it off can produce work nobody is waiting for. |
+| `replier.provision.max-redelivery` | `3` | Zero means redeliver forever, so one malformed message loops indefinitely. |
+| `java.reconnect-retries` | — | Set this to at least 100 with a 3000 ms wait, which gives the 300 seconds needed to survive an HA failover. The commonly copied value of 20 only gives 60 seconds. |
+| `tracing.enabled` | `false` | See [Distributed tracing](#distributed-tracing). |
 
 ### The temporary queue hazard
 
@@ -194,18 +232,28 @@ queue but does not restore its topic subscription.
 In that state the session is connected, the flow is bound, the queue exists, and nothing is logged.
 Every request times out until the process is restarted.
 
-The `recreate-on-reconnect` setting handles this by redoing the whole sequence after a reconnect, and
-`GET /api/diagnostics/reply-path` lets you check the current state. Using `DURABLE` avoids the
-problem entirely.
+Two settings deal with this. `recreate-on-reconnect` redoes the whole sequence after a reconnect.
+`canary-on-reconnect` then publishes a probe to this instance's own reply topic and requires it to
+come back, which is the only check that proves a message can actually complete the round trip. The
+result is reported through the reply-path health indicator, so a readiness probe can remove the
+instance rather than leaving it to accept requests it cannot answer.
+
+Using `DURABLE` avoids the problem entirely.
 
 ### Provisioning modes
 
 `replier.provision.mode` accepts `CREATE_IF_MISSING` (the default), `VALIDATE` and `OFF`.
 
 Creating on startup is safe to leave enabled because configuration drift is reported rather than
-ignored. `FLAG_IGNORE_ALREADY_EXISTS` only suppresses the "already exists" error. If the queue exists
-with different properties, JCSMP raises `PropertyMismatchException`, which names the property that
-differs. This was verified against a live broker; see [spike/README.md](spike/README.md).
+ignored. `FLAG_IGNORE_ALREADY_EXISTS` only suppresses the "already exists" error. If the queue
+exists with different properties, JCSMP raises `PropertyMismatchException`, which names the property
+that differs. This was verified against a live broker; see [spike/README.md](spike/README.md).
+
+Partition counts are the exception. JCSMP cannot express one, so a partitioned queue is created or
+verified over SEMP, using the management credentials under
+`replier.partitioning.semp`. A count that does not match is a startup failure rather
+than something the application changes on its own, because Solace requires the queue to be drained
+first and reducing the count deletes the messages held in the removed partitions.
 
 ---
 
@@ -394,7 +442,7 @@ The report always states which mode produced it.
 ./mvnw test        # starts a broker with Testcontainers
 ```
 
-Thirteen integration tests run against a real broker. The behaviour that matters here belongs to the
+Sixteen integration tests run against a real broker. The behaviour that matters here belongs to the
 interaction with the broker, so a test that mocked it would not catch the problems these are written
 to catch.
 
@@ -404,6 +452,8 @@ to catch.
 | `ReplyPathReconnectIntegrationTest` | replies still arrive after the connection is cut from outside using SEMP. Without re-subscription the queue would exist, the flow would be bound, nothing would be logged, and every request would time out. |
 | `ProvisionDriftIntegrationTest` | re-provisioning with identical properties is a no-op; differing properties raise `PropertyMismatchException`; the ignore flag only suppresses "already exists" |
 | `PartitionedQueueIntegrationTest` | SEMP creates a partitioned queue; resizing is refused unless explicitly allowed, because a decrease deletes messages; a clear error when SEMP is not configured |
+| `ReplyPathCanaryIntegrationTest` | the probe completes and health reports UP; when the subscription is removed behind the library's back, the probe fails and health reports DOWN; re-applying the subscription restores it |
+| `MinimalConfigIntegrationTest` | the minimal configuration shown in this README actually round-trips, so the example cannot rot |
 | `TracingToggleIntegrationTest` | tracing is off by default and active when configured |
 
 The tests use `GenericContainer` rather than the Testcontainers Solace module. The module rejects

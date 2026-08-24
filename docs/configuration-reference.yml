@@ -1,0 +1,243 @@
+# ---------------------------------------------------------------------------
+# Complete configuration reference
+#
+# Every property this library reads, with its default. Copy the parts you need
+# into your own application.yml; you do not need all of this. A working example
+# with real values is in booking-demo/src/main/resources/application.yml.
+#
+# Connection settings live under solace.java.*, which is the namespace the
+# official solace-java-spring-boot-starter binds. This library adds nothing
+# there and reinvents none of it.
+# ---------------------------------------------------------------------------
+
+solace:
+
+  # ---------------------------------------------------------------- connection
+  # Owned by solace-java-spring-boot-starter, not by this library. Listed here
+  # because you need it, and because a few values are worth choosing carefully.
+  java:
+    host: tcp://localhost:55565          # tcps://... for TLS. macOS reserves 55555.
+    msg-vpn: default
+    client-username: default
+    client-password: default
+
+    # A readable client name makes this application identifiable in the broker's
+    # client list, which matters during a support call. Defaults to a generated
+    # value that tells an operator nothing.
+    client-name: ${HOSTNAME:my-app}
+
+    connect-retries: 1
+    connect-retries-per-host: 5
+
+    # 100 retries x 3000ms = 300s, which is the documented target for surviving
+    # an HA failover. The value 20 is often copied from examples and only gives
+    # 60s. Use -1 where replication or DR failover is involved, because that
+    # duration is not bounded.
+    reconnect-retries: 100
+    reconnect-retry-wait-in-millis: 3000
+
+    # Any JCSMP property can be set here.
+    api-properties:
+      # Subscriptions are re-added after a reconnect, so without this the broker
+      # returns "already exists" and the logs fill with harmless errors.
+      IGNORE_DUPLICATE_SUBSCRIPTION_ERROR: true
+
+  # -------------------------------------------------------------- this library
+  request-reply:
+
+    # Master switch. When false, none of the beans below are created.
+    enabled: true
+
+    # ------------------------------------------------------------ the requestor
+    request:
+
+      # Default deadline when a caller does not pass one to sendAndReceive.
+      timeout: 5s
+
+      # PERSISTENT or DIRECT. PERSISTENT is the point of this design: the request
+      # is spooled by the broker and survives a replier restart. DIRECT is faster
+      # but a request is lost if no replier is connected.
+      delivery-mode: PERSISTENT
+
+      # Sets the message TTL equal to the timeout above. Recommended. Without it
+      # a request can sit in the queue longer than the requestor is willing to
+      # wait, and then be processed by a replier after nobody is listening. In a
+      # booking system that produces a reservation the customer never sees.
+      ttl-matches-timeout: true
+
+      # SpEL evaluated against the request payload to produce the partition key.
+      # An explicit argument to sendAndReceive overrides it.
+      #
+      # Choose the granularity of the contended resource, not the request. Too
+      # coarse and you get hot partitions; too fine, such as a request id, and it
+      # hashes randomly, which gives you flat-queue behaviour while looking
+      # correct. The key is ignored by a flat queue, so it is safe to set now and
+      # enable partitioning later without touching the application.
+      partition-key-expression: "partitionKey()"
+
+      # Stamps a monotonic sequence number on each request, which lets the load
+      # test detect message loss and out-of-order arrival.
+      sequence-numbers: true
+
+    # -------------------------------------------------- this instance's replies
+    reply:
+
+      # TEMPORARY needs no provisioning and leaves nothing behind, which makes a
+      # first run simple. DURABLE is recommended for production, because its
+      # subscription is a broker-side object and survives reconnects; it needs a
+      # stable instance id and a plan for draining orphaned queues.
+      endpoint-type: TEMPORARY           # TEMPORARY | DURABLE
+
+      # The reply topic. {placeholders} are substituted; see the two lists below.
+      topic-pattern: "requestreply/reply/v1/{instanceId}"
+
+      # Placeholders resolved per request rather than once at startup. These
+      # become * in the subscription and are filled in at publish time, so one
+      # subscription covers every value.
+      per-request-placeholders: []
+      #  - trainNo
+
+      # SpEL for each per-request placeholder, evaluated against the payload.
+      # A placeholder listed above without an expression here renders as
+      # "unknown". The subscription still matches, so nothing breaks, but the
+      # information is lost.
+      per-request-placeholder-expressions: {}
+      #  trainNo: "trainNo()"
+
+      # Static placeholder values, resolved once and appearing literally in the
+      # subscription.
+      placeholders: {}
+      #  zone: nr
+
+      # Identity of this instance. Blank resolves to the hostname plus a short
+      # random suffix. The suffix matters: it stops a restarted process from
+      # picking up replies addressed to its previous incarnation, whose futures
+      # died with it.
+      instance-id: ""
+
+      queue-name-pattern: "q.requestreply.reply.{instanceId}"
+
+      # After a reconnect, re-create the endpoint, re-apply the subscription and
+      # re-bind the flow. Leave this on. A temporary queue that outlives its
+      # linger window is recreated by the broker without its subscription, and in
+      # that state nothing is logged while every request times out.
+      recreate-on-reconnect: true
+
+      # Publish a probe to our own reply topic and require it back, at startup
+      # and after every reconnect. This is what turns the failure above into
+      # something observable: it is the only check that requires a message to
+      # complete the round trip. Reported by the reply-path health indicator.
+      canary-on-reconnect: true
+      canary-timeout: 10s
+
+      # How long waitForReplyEndpoint() blocks during startup.
+      wait-for-endpoint: 10s
+
+      # Spool quota for a DURABLE reply queue, in MB. Ignored for TEMPORARY.
+      quota-mb: 100
+
+    # -------------------------------------------------------------- the replier
+    replier:
+
+      # The queue every replier instance binds. This is the consumer group: the
+      # broker load-balances across the bound flows, which is what stops one
+      # request being handled by every instance.
+      queue: q.my.service.requests
+
+      # Topic subscriptions mapped onto that queue. Wildcards are evaluated by
+      # the broker, so the application never sees what it did not ask for.
+      topics:
+        - "my/service/request/v1/>"
+
+      access-type: NON_EXCLUSIVE         # NON_EXCLUSIVE | EXCLUSIVE
+
+      # Flows bound to the queue by this instance, and the size of the handler
+      # thread pool.
+      concurrency: 4
+
+      provision:
+        # CREATE_IF_MISSING creates the queue when absent and fails startup if an
+        # existing queue's properties differ. Safe to leave enabled, because
+        # drift is reported rather than ignored.
+        # VALIDATE never creates, and fails if the queue is missing or drifted.
+        # OFF assumes the queue exists and checks nothing.
+        mode: CREATE_IF_MISSING          # OFF | VALIDATE | CREATE_IF_MISSING
+
+        quota-mb: 5000
+
+        # 0 means redeliver forever, which lets one malformed message loop
+        # indefinitely. Set a limit and give the queue a dead message queue.
+        max-redelivery: 3
+
+        # Honour the TTL set by the publisher, which is what makes
+        # request.ttl-matches-timeout effective.
+        respects-ttl: true
+
+        # Tell the publisher when a message is discarded, so the requestor learns
+        # its request was dropped instead of only timing out.
+        discard-notify-sender: true
+
+      partitioning:
+        # 0 is a flat queue. A flat queue needs no SEMP access and keeps
+        # selectors, queue browsing and replay, but gives no ordering: two
+        # concurrent requests for the same resource are handled in parallel.
+        #
+        # Above 0 expects a partitioned queue, which serialises requests sharing
+        # a partition key. JCSMP cannot express a partition count at any version,
+        # so this is applied over SEMP.
+        #
+        # Sizing, per Solace guidance: the maximum number of consumers you expect
+        # to bind. Concurrency 10 across 3 instances is 30 flows, so use 32.
+        partition-count: 0
+
+        # Seconds the broker waits for consumer count to settle before
+        # rebalancing, and how long consumers get to acknowledge outstanding
+        # messages during a handoff.
+        rebalance-delay: 5s
+        rebalance-max-handoff-time: 3s
+
+        # Permit changing the partition count on an existing queue. Off by
+        # default, and deliberately so: Solace requires the queue to be drained
+        # first, and reducing the count deletes the messages held in the removed
+        # partitions. Leaving this off turns a mismatch into a startup failure
+        # rather than silent data loss during a redeploy.
+        allow-partition-resize: false
+
+        # Only consulted when partition-count is above 0. These are management
+        # credentials, which are more privileged than the messaging ones above.
+        # In production, do this bootstrap from an init container or Terraform so
+        # the running application never holds them and can use VALIDATE instead.
+        semp:
+          url: ""                        # e.g. http://localhost:8085
+          username: ""
+          password: ""
+          msg-vpn: default
+
+    # --------------------------------------------------------------- tracing
+    tracing:
+      # Off by default. Activating it also requires the OpenTelemetry API on the
+      # classpath and no TracingContextBridge bean of your own. If any of those
+      # is missing, the library uses a no-op bridge that captures nothing.
+      enabled: false
+
+      # Carry W3C trace context in messages so a trace spans processes. Needs
+      # com.solace:solace-opentelemetry-jcsmp-integration. Without that library
+      # the in-process behaviour still works and a warning explains what is
+      # missing.
+      propagate-context: true
+
+# ---------------------------------------------------------------------------
+# Demo-only settings. These belong to booking-demo, not to the library.
+# ---------------------------------------------------------------------------
+booking:
+  topics:
+    request-pattern: "cris/booking/seatReserve/request/v1/{zone}/{trainNo}"
+    request-subscription: "cris/booking/seatReserve/request/v1/>"
+
+# Used by the standalone latency test, under --spring.profiles.active=loadtest.
+loadtest:
+  count: 5000
+  concurrency: 32
+  warmup: 200
+  mode: CLOSED_LOOP                      # CLOSED_LOOP | OPEN_LOOP
+  rate: 1000                             # requests per second, OPEN_LOOP only

@@ -25,13 +25,8 @@ public class TracingProperties {
      */
     private boolean propagateContext = true;
 
-    /** Instrumentation scope name reported to the tracing backend. */
-    private String instrumentationName = "com.solace.samples.requestreply";
-
     public boolean isEnabled() { return enabled; }
     public void setEnabled(boolean enabled) { this.enabled = enabled; }
     public boolean isPropagateContext() { return propagateContext; }
     public void setPropagateContext(boolean v) { this.propagateContext = v; }
-    public String getInstrumentationName() { return instrumentationName; }
-    public void setInstrumentationName(String v) { this.instrumentationName = v; }
 }

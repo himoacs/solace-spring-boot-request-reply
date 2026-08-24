@@ -142,6 +142,15 @@ public class SolaceRequestReplyAutoConfiguration {
     }
 
     @Bean
+    @ConditionalOnMissingBean(name = "solaceReplyPathHealthIndicator")
+    @ConditionalOnClass(name = "org.springframework.boot.actuate.health.HealthIndicator")
+    public ReplyPathHealthIndicator solaceReplyPathHealthIndicator(
+            SolaceSession session, ReplyEndpoint replyEndpoint, ReplyingSolaceTemplate template) {
+        return new ReplyPathHealthIndicator(session, replyEndpoint,
+                (DefaultReplyingSolaceTemplate) template);
+    }
+
+    @Bean
     @ConditionalOnMissingBean
     public SempClient sempClient(SolaceRequestReplyProperties props) {
         return new SempClient(props.getReplier().getPartitioning());
