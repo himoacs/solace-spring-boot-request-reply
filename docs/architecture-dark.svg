@@ -1,0 +1,79 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1120 540" width="1120" height="540" role="img" aria-label="Request path through a shared non-exclusive queue to competing repliers, and reply path back through a per-instance reply queue.">
+<style>
+    .bg{fill:#131612}
+    .bx{fill:#1B1F1B;stroke:#434A43;stroke-width:1.25}
+    .topic{fill:none;stroke:#5FAE85;stroke-width:1.25;stroke-dasharray:5 3}
+    .q{fill:#17251D;stroke:#5FAE85;stroke-width:1.25}
+    .part{fill:none;stroke:#5FAE85;stroke-width:1;opacity:.5;stroke-dasharray:4 3}
+    .fl{fill:none;stroke:#5FAE85;stroke-width:1.75}
+    .ar{fill:#5FAE85}
+    .div{stroke:#434A43;stroke-width:1;stroke-dasharray:2 4}
+    .t{fill:#E7EAE3;font-family:system-ui,-apple-system,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;font-size:13.5px}
+    .t.sm{fill:#98A199;font-size:11.5px}
+    .m{fill:#98A199;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,'Liberation Mono',monospace;font-size:11px}
+    .lbl{fill:#5FAE85;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,'Liberation Mono',monospace;font-size:11px;letter-spacing:.09em;font-weight:600}
+    </style>
+<rect class="bg" x="0" y="0" width="1120" height="540"/>
+<g transform="translate(20,20)">
+<text class="lbl" x="0" y="18">REQUEST PATH — ONE SHARED QUEUE, COMPETING CONSUMERS</text>
+<rect class="bx" x="0" y="42" width="168" height="54" rx="3"/>
+<text class="t" x="14" y="64">Requestor A</text>
+<text class="m" x="14" y="83">client-0</text>
+<rect class="bx" x="0" y="108" width="168" height="54" rx="3"/>
+<text class="t" x="14" y="130">Requestor B</text>
+<text class="m" x="14" y="149">client-1</text>
+<line class="fl" x1="168" y1="102" x2="318" y2="102"/><polygon class="ar" points="318,102 310,98 310,106"/>
+<text class="t sm" x="176" y="92">PERSISTENT</text>
+<text class="m" x="176" y="120">+ partition key</text>
+<rect class="topic" x="330" y="64" width="214" height="76" rx="3"/>
+<text class="t" x="344" y="88">Request topic</text>
+<text class="m" x="344" y="110">…/request/v1/</text>
+<text class="m" x="344" y="128">{zone}/{trainNo}</text>
+<line class="fl" x1="544" y1="102" x2="646" y2="102"/><polygon class="ar" points="646,102 638,98 638,106"/>
+<text class="m" x="556" y="92">subscription</text>
+<rect class="q" x="658" y="50" width="224" height="104" rx="3"/>
+<text class="t" x="672" y="74">q.cris.booking.seatReserve</text>
+<text class="m" x="672" y="94">non-exclusive · flat by default</text>
+<rect class="part" x="672" y="106" width="196" height="34" rx="2"/>
+<text class="m" x="684" y="128">partitions are opt-in</text>
+<line class="fl" x1="882" y1="72" x2="962" y2="72"/><polygon class="ar" points="962,72 954,68 954,76"/>
+<line class="fl" x1="882" y1="102" x2="962" y2="102"/><polygon class="ar" points="962,102 954,98 954,106"/>
+<line class="fl" x1="882" y1="132" x2="962" y2="132"/><polygon class="ar" points="962,132 954,128 954,136"/>
+<rect class="bx" x="974" y="56" width="106" height="30" rx="3"/>
+<text class="t" x="986" y="76">Replier 1</text>
+<rect class="bx" x="974" y="92" width="106" height="30" rx="3"/>
+<text class="t" x="986" y="112">Replier 2</text>
+<rect class="bx" x="974" y="128" width="106" height="30" rx="3"/>
+<text class="t" x="986" y="148">Replier 3</text>
+<line class="div" x1="0" y1="212" x2="1080" y2="212"/>
+<text class="lbl" x="0" y="248">REPLY PATH — ONE QUEUE PER REQUESTOR INSTANCE</text>
+<rect class="bx" x="912" y="272" width="168" height="76" rx="3"/>
+<text class="t" x="926" y="296">Replier</text>
+<text class="m" x="926" y="317">publishes to</text>
+<text class="m" x="926" y="335">msg.replyTo</text>
+<line class="fl" x1="912" y1="310" x2="800" y2="310"/><polygon class="ar" points="800,310 808,306 808,314"/>
+<text class="t sm" x="812" y="300">PERSISTENT</text>
+<text class="m" x="812" y="328">TTL = timeout</text>
+<rect class="topic" x="566" y="272" width="222" height="76" rx="3"/>
+<text class="t" x="580" y="296">Reply topic</text>
+<text class="m" x="580" y="318">…/reply/v1/{zone}/</text>
+<text class="m" x="580" y="336">{trainNo}/{instanceId}</text>
+<line class="fl" x1="566" y1="310" x2="486" y2="310"/><polygon class="ar" points="486,310 494,306 494,314"/>
+<rect class="q" x="310" y="272" width="164" height="40" rx="3"/>
+<text class="m" x="322" y="290">q…reply.client-0</text>
+<text class="m" x="322" y="306">sub …/*/client-0</text>
+<rect class="q" x="310" y="322" width="164" height="40" rx="3"/>
+<text class="m" x="322" y="340">q…reply.client-1</text>
+<text class="m" x="322" y="356">sub …/*/client-1</text>
+<path class="fl" d="M310 292 H 250 V 430"/>
+<polygon class="ar" points="250,430 246,422 254,422"/>
+<path class="fl" d="M310 342 H 286 V 430"/>
+<polygon class="ar" points="286,430 282,422 290,422"/>
+<rect class="bx" x="0" y="440" width="300" height="56" rx="3"/>
+<text class="t" x="14" y="464">Correlation store completes the future</text>
+<text class="m" x="14" y="484">in the originating JVM only</text>
+<text class="t sm" x="566" y="392">A reply is only useful to the instance that sent the</text>
+<text class="t sm" x="566" y="412">request, because the future it completes is held in</text>
+<text class="t sm" x="566" y="432">that JVM's heap.</text>
+</g>
+</svg>

@@ -47,37 +47,10 @@ On macOS, port 55555 is reserved by the operating system, so the broker publishe
 
 ## How it works
 
-```mermaid
-flowchart TB
-    subgraph REQ["Requestor instances"]
-        direction LR
-        C0["client-0"]
-        C1["client-1"]
-    end
-
-    T1["Request topic<br/>cris/booking/seatReserve/request/v1/nr/12951"]
-    Q1[("q.cris.booking.seatReserve<br/>durable, non-exclusive")]
-
-    subgraph REP["Replier instances, competing for the same queue"]
-        direction LR
-        S1["replier-1"]
-        S2["replier-2"]
-        S3["replier-3"]
-    end
-
-    T2["Reply topic<br/>cris/booking/seatReserve/reply/v1/nr/12951/client-0"]
-    Q2[("q.cris.booking.reply.client-0<br/>exclusive, one consumer")]
-
-    C0 -- "1. publish PERSISTENT with a partition key" --> T1
-    C1 --> T1
-    T1 -- "2. topic subscription on the queue" --> Q1
-    Q1 -- "3. exactly one replier receives it" --> S1
-    Q1 --> S2
-    Q1 --> S3
-    S1 -- "4. publish the reply to the request's replyTo" --> T2
-    T2 -- "5. subscription with a wildcard level" --> Q2
-    Q2 -- "6. the waiting future completes" --> C0
-```
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/architecture-dark.svg">
+  <img alt="Request path through a shared non-exclusive queue to competing repliers, and reply path back through a per-instance reply queue" src="docs/architecture-light.svg">
+</picture>
 
 Requests go to a single shared queue that many repliers consume from. Any replier can handle any
 booking, so the broker load-balances across them.
