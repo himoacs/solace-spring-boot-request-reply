@@ -80,7 +80,7 @@ public class SempClient {
 
     private Integer readPartitionCount(String queueName) {
         HttpResponse<String> res = send("GET", queuePath(queueName), null);
-        if (res.statusCode() == 404) { return null; }
+        if (isNotFound(res)) { return null; }
         expectSuccess(res, queueName, "read");
         Matcher m = PARTITION_COUNT.matcher(res.body());
         return m.find() ? Integer.parseInt(m.group(1)) : 0;
@@ -136,6 +136,18 @@ public class SempClient {
     private String basicAuth() {
         String raw = cfg.getSemp().getUsername() + ":" + cfg.getSemp().getPassword();
         return "Basic " + Base64.getEncoder().encodeToString(raw.getBytes(StandardCharsets.UTF_8));
+    }
+
+    /**
+     * SEMP signals a missing object with <b>HTTP 400</b> and {@code "status":"NOT_FOUND"} in the
+     * body, not with 404. Checking only the status code makes "create if missing" never fire, and
+     * turns a routine first run into a startup failure.
+     */
+    private static boolean isNotFound(HttpResponse<String> res) {
+        if (res.statusCode() == 404) { return true; }
+        return res.statusCode() / 100 == 4
+                && res.body() != null
+                && res.body().contains("\"status\":\"NOT_FOUND\"");
     }
 
     private static void expectSuccess(HttpResponse<String> res, String queueName, String what) {

@@ -15,6 +15,7 @@ import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
@@ -50,6 +51,24 @@ public class BookingController {
 
     @PostMapping
     public ResponseEntity<Map<String, Object>> book(@Valid @RequestBody BookingRequest request) {
+        return execute(request, null);
+    }
+
+    /**
+     * Replays a booking under a caller-supplied correlation id.
+     *
+     * <p>This is the double-booking guard, made testable. Guaranteed delivery is at-least-once, so
+     * a replier that reserves a seat and dies before acknowledging will see the same request again.
+     * Posting the same id twice must produce <b>one</b> reservation and a second reply flagged
+     * {@code replayed}. Without an endpoint like this the property is asserted rather than shown.
+     */
+    @PostMapping("/replay")
+    public ResponseEntity<Map<String, Object>> replay(@Valid @RequestBody BookingRequest request,
+                                                      @RequestParam String correlationId) {
+        return execute(request, correlationId);
+    }
+
+    private ResponseEntity<Map<String, Object>> execute(BookingRequest request, String correlationId) {
         String topic = requestTopicPattern
                 .replace("{zone}", request.zone())
                 .replace("{trainNo}", request.trainNo());
@@ -57,7 +76,7 @@ public class BookingController {
         long start = System.nanoTime();
         RequestReplyFuture<SeatReservation> future = template.sendAndReceive(
                 topic, request.partitionKey(), request, SeatReservation.class,
-                template.defaultReplyTimeout());
+                template.defaultReplyTimeout(), correlationId);
 
         // Stage one: did the broker accept and spool the request?
         long confirmNanos;

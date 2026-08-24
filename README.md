@@ -229,6 +229,66 @@ broker — see [spike/README.md](spike/README.md).
 
 ---
 
+## Distributed tracing (optional, off by default)
+
+Disabled unless you ask for it, and inert even then if the OpenTelemetry libraries are absent —
+so a customer who wants nothing to do with tracing changes no configuration and carries no
+dependency.
+
+```yaml
+solace:
+  request-reply:
+    tracing:
+      enabled: false          # default. true activates it
+      propagate-context: true # carry W3C trace context between processes
+```
+
+Three conditions must all hold for it to activate: the flag is true, the OpenTelemetry API is on
+the classpath, and no `TracingContextBridge` bean is already defined. Fail any one and the library
+uses a no-op bridge that captures nothing and wraps nothing.
+
+`GET /api/diagnostics/endpoints` reports both `configuredEnabled` and `active`, which are
+deliberately separate — tracing can be switched on and still be inert.
+
+To turn it on, add the dependencies and flip the flag:
+
+```xml
+<dependency>
+  <groupId>io.opentelemetry</groupId><artifactId>opentelemetry-api</artifactId>
+</dependency>
+<dependency>
+  <!-- JCSMP has its OWN integration, distinct from the newer Java API's -->
+  <groupId>com.solace</groupId><artifactId>solace-opentelemetry-jcsmp-integration</artifactId>
+</dependency>
+```
+
+### What it does that metrics cannot
+
+Two different jobs, and the first is easy to overlook:
+
+- **Capture and restore** fixes *parent attribution*. `future.complete()` runs its dependents on
+  the thread that completed it, holding the **reply's** context — but the span that should parent
+  the continuation is the one active when the request was issued. Without this the trace is
+  connected and wrongly parented, which is harder to spot than a broken one. The request's context
+  is stored in `PendingRequest` and restored on completion.
+- **Inject and extract** carries trace context in the message, so requestor and replier appear in
+  one trace rather than two.
+
+Cross-process propagation needs the Solace integration jar; without it the in-process half still
+works and a warning explains what is missing. Broker-side spans (which put both ends of a queue
+dwell on the *broker's* clock, eliminating clock skew) additionally need a telemetry profile on the
+broker and an OpenTelemetry Collector with the Solace receiver.
+
+### One interaction worth knowing
+
+This design moves the handler and future completion onto bounded executors, off the JCSMP dispatch
+thread. OpenTelemetry context lives in a thread-local, and the Java agent propagates it across
+executors by an **exact class-name allowlist** — `ThreadPoolExecutor` is on it, a custom
+`Executor` is not. Both pools here are therefore plain JDK pools: the ordinary choice is also the
+one that keeps traces whole. Substituting a custom `Executor` would silently break propagation.
+
+---
+
 ## Coming from Spring Kafka
 
 | Spring Kafka | Here |
@@ -270,6 +330,27 @@ broker — see [spike/README.md](spike/README.md).
 | `GET /actuator/health` | session and endpoint state |
 
 ---
+
+## Tests
+
+```bash
+./mvnw test        # spins up a broker via Testcontainers
+```
+
+13 integration tests against a real broker. They exist because the properties that matter here are
+properties of the *broker interaction*, and none of them can be caught by a test that mocks it.
+
+| Test | Asserts |
+|---|---|
+| `RequestReplyIntegrationTest` | round trip; the send future resolving independently of the reply; **one request doing work exactly once despite three competing flows**; a replayed correlation id not repeating the work; 60 concurrent requests correlated independently; timeout eviction leaving nothing pending |
+| `ReplyPathReconnectIntegrationTest` | replies still arrive after the connection is **severed from outside** via SEMP. The single most valuable test here: without re-subscription the queue would exist, the flow would be bound, nothing would log, and every request would time out for ever |
+| `ProvisionDriftIntegrationTest` | identical re-provision is idempotent; drifted properties raise `PropertyMismatchException`; the ignore flag suppresses only "already exists". This is what makes `CREATE_IF_MISSING` safe as a default |
+| `PartitionedQueueIntegrationTest` | SEMP creates a partitioned queue; a resize is refused unless explicitly allowed, because it deletes messages; a clear error when SEMP is unconfigured |
+| `TracingToggleIntegrationTest` | tracing genuinely off by default, genuinely on when configured |
+
+Note the Testcontainers setup uses `GenericContainer` rather than the Solace module: the module
+rejects `default` as a username and does not set `container=docker` or a large enough shared-memory
+size, without which this image fails platform detection and exits.
 
 ## Layout
 

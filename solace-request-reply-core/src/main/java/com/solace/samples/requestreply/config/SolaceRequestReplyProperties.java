@@ -25,12 +25,15 @@ public class SolaceRequestReplyProperties {
     private final Reply reply = new Reply();
     @NestedConfigurationProperty
     private final Replier replier = new Replier();
+    @NestedConfigurationProperty
+    private final TracingProperties tracing = new TracingProperties();
 
     public boolean isEnabled() { return enabled; }
     public void setEnabled(boolean enabled) { this.enabled = enabled; }
     public Request getRequest() { return request; }
     public Reply getReply() { return reply; }
     public Replier getReplier() { return replier; }
+    public TracingProperties getTracing() { return tracing; }
 
     // ------------------------------------------------------------------ request
 

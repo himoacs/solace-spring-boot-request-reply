@@ -89,6 +89,12 @@ solace:
           password: ${SEMP_PASS:}
           msg-vpn: ${SOLACE_VPN:default}
 
+    tracing:
+      # Off by default, and inert even when true unless the OpenTelemetry libraries are present.
+      # Set true plus add opentelemetry-api and solace-opentelemetry-jcsmp-integration to enable.
+      enabled: ${TRACING_ENABLED:false}
+      propagate-context: true
+
 booking:
   topics:
     request-pattern: "cris/booking/seatReserve/request/v1/{zone}/{trainNo}"

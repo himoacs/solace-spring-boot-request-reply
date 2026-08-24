@@ -86,8 +86,9 @@ public class SolaceRequestReplyAutoConfiguration {
     @Bean(destroyMethod = "close")
     @ConditionalOnMissingBean
     public PersistentPublisher persistentPublisher(SolaceSession session,
-                                                   SolaceRequestReplyProperties props) {
-        return new PersistentPublisher(session, props.getRequest().getDeliveryMode());
+                                                   SolaceRequestReplyProperties props,
+                                                   TracingContextBridge tracing) {
+        return new PersistentPublisher(session, props.getRequest().getDeliveryMode(), tracing);
     }
 
     @Bean

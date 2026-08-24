@@ -108,8 +108,13 @@ public class SolaceMessageListenerContainer implements AutoCloseable {
      * on this instance, and a nested request from it could never complete.
      */
     private void onRequest(BytesXMLMessage raw) {
-        Object ctx = tracing.captureCurrent();
-        handlerExecutor.execute(tracing.wrap(ctx, () -> handle(raw)));
+        // Prefer the context carried in the message: it makes the handler a child of the span
+        // that issued the request, in the other process. Falling back to the dispatch thread's
+        // context would produce a valid trace rooted in the wrong place.
+        Object ctx = tracing.extract(raw);
+        if (ctx == null) { ctx = tracing.captureCurrent(); }
+        Object finalCtx = ctx;
+        handlerExecutor.execute(tracing.wrap(finalCtx, () -> handle(raw)));
     }
 
     private void handle(BytesXMLMessage raw) {

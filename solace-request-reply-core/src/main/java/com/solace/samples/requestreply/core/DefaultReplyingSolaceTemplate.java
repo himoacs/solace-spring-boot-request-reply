@@ -164,7 +164,17 @@ public class DefaultReplyingSolaceTemplate implements ReplyingSolaceTemplate, Au
     @Override
     public <T, R> RequestReplyFuture<R> sendAndReceive(String topic, String partitionKey, T payload,
                                                        Class<R> replyType, Duration timeout) {
+        return sendAndReceive(topic, partitionKey, payload, replyType, timeout, null);
+    }
+
+    @Override
+    public <T, R> RequestReplyFuture<R> sendAndReceive(String topic, String partitionKey, T payload,
+                                                       Class<R> replyType, Duration timeout,
+                                                       String correlationId) {
         RequestReplyMessage request = new RequestReplyMessage(codec.serialize(payload));
+        if (correlationId != null && !correlationId.isBlank()) {
+            request.setCorrelationId(correlationId);
+        }
         request.setPartitionKey(partitionKey != null ? partitionKey : derivePartitionKey(payload));
         // Reply-topic placeholders are derived here, where the typed payload is still available;
         // by the time the raw path runs the payload is opaque bytes.

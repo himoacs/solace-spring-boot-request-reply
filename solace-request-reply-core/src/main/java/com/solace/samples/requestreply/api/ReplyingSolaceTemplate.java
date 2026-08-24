@@ -37,9 +37,20 @@ public interface ReplyingSolaceTemplate {
         return sendAndReceive(topic, null, payload, replyType, defaultReplyTimeout());
     }
 
-    /** Raw form, for callers that manage their own serialization and headers. */
+    /**
+     * Raw form, for callers that manage their own serialization and headers.
+     *
+     * <p>Setting {@code request.correlationId} explicitly reuses it rather than generating one,
+     * which is how a redelivery can be reproduced on demand: the same id twice must yield one
+     * reservation and two identical replies.
+     */
     RequestReplyFuture<RequestReplyMessage> sendAndReceive(String topic, RequestReplyMessage request,
                                                           Duration timeout);
+
+    /** Typed form with an explicit correlation id, for replaying a request. */
+    <T, R> RequestReplyFuture<R> sendAndReceive(String topic, String partitionKey, T payload,
+                                               Class<R> replyType, Duration timeout,
+                                               String correlationId);
 
     Duration defaultReplyTimeout();
 

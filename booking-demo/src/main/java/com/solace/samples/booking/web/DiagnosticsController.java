@@ -4,6 +4,7 @@ import com.solace.samples.booking.replier.SeatInventoryService;
 import com.solace.samples.requestreply.api.ReplyingSolaceTemplate;
 import com.solace.samples.requestreply.config.SolaceRequestReplyProperties;
 import com.solace.samples.requestreply.core.CorrelationStore;
+import com.solace.samples.requestreply.core.TracingContextBridge;
 import com.solace.samples.requestreply.endpoint.ReplyEndpoint;
 import com.solace.samples.requestreply.transport.SolaceSession;
 import org.springframework.beans.factory.ObjectProvider;
@@ -31,17 +32,20 @@ public class DiagnosticsController {
     private final SolaceRequestReplyProperties props;
     private final CorrelationStore store;
     private final ObjectProvider<SeatInventoryService> inventory;
+    private final TracingContextBridge tracing;
 
     public DiagnosticsController(SolaceSession session, ReplyEndpoint replyEndpoint,
                                  ReplyingSolaceTemplate template,
                                  SolaceRequestReplyProperties props, CorrelationStore store,
-                                 ObjectProvider<SeatInventoryService> inventory) {
+                                 ObjectProvider<SeatInventoryService> inventory,
+                                 TracingContextBridge tracing) {
         this.session = session;
         this.replyEndpoint = replyEndpoint;
         this.template = template;
         this.props = props;
         this.store = store;
         this.inventory = inventory;
+        this.tracing = tracing;
     }
 
     @GetMapping("/endpoints")
@@ -82,6 +86,15 @@ public class DiagnosticsController {
         SeatInventoryService inv = inventory.getIfAvailable();
         if (inv != null) { flight.put("distinctReservations", inv.reservationCount()); }
         out.put("inFlight", flight);
+
+        Map<String, Object> tr = new LinkedHashMap<>();
+        tr.put("configuredEnabled", props.getTracing().isEnabled());
+        // Distinct from the flag: tracing can be switched on and still be inert if the
+        // OpenTelemetry libraries are absent, so report what is actually in effect.
+        tr.put("active", tracing.isActive());
+        tr.put("propagateContext", props.getTracing().isPropagateContext());
+        tr.put("bridge", tracing.getClass().getSimpleName());
+        out.put("tracing", tr);
 
         return out;
     }
