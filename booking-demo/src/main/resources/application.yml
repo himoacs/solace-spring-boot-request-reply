@@ -1,0 +1,108 @@
+# ---------------------------------------------------------------------------
+# Train seat reservation demo
+#
+# Connection settings live under solace.java.*, which is the namespace the official
+# solace-java-spring-boot-starter already binds. Nothing here reinvents them.
+# ---------------------------------------------------------------------------
+spring:
+  application:
+    name: booking-demo
+
+server:
+  port: ${SERVER_PORT:8091}
+
+solace:
+  java:
+    host: ${SOLACE_HOST:tcp://localhost:55565}
+    msg-vpn: ${SOLACE_VPN:default}
+    client-username: ${SOLACE_USER:default}
+    client-password: ${SOLACE_PASS:default}
+    # A readable client name is what makes this app identifiable in the broker's client list
+    # during a support call.
+    client-name: ${HOSTNAME:booking-demo}
+    connect-retries: 1
+    connect-retries-per-host: 5
+    # 100 x 3000ms = 300s, the documented HA target. The commonly copied 20 gives only 60s.
+    # Use -1 where replication or DR failover is in play, since that duration is unbounded.
+    reconnect-retries: 100
+    reconnect-retry-wait-in-millis: 3000
+    api-properties:
+      # Silences benign "already exists" noise when a subscription is re-added on reconnect.
+      IGNORE_DUPLICATE_SUBSCRIPTION_ERROR: true
+
+  request-reply:
+    request:
+      timeout: 5s
+      delivery-mode: PERSISTENT
+      # Without this a queued request can outlive the requestor's patience and be acted on
+      # after nobody is waiting — a reservation the customer never sees confirmed.
+      ttl-matches-timeout: true
+      partition-key-expression: "partitionKey()"
+      sequence-numbers: true
+
+    reply:
+      # TEMPORARY needs no provisioning and leaves nothing behind, which is why it is the
+      # default. DURABLE is recommended for production: its subscription is a broker-side
+      # object and survives reconnects outright.
+      endpoint-type: TEMPORARY
+      topic-pattern: "cris/booking/seatReserve/reply/v1/{zone}/{trainNo}/{instanceId}"
+      # trainNo is filled in per request and wildcarded in the subscription, so one
+      # subscription covers every train while the topic still names the one in play.
+      per-request-placeholders:
+        - trainNo
+      # Without this the level would render as 'unknown': the subscription still matches, because
+      # that level is wildcarded, so the only casualty is observability.
+      per-request-placeholder-expressions:
+        trainNo: "trainNo()"
+      placeholders:
+        zone: nr
+      queue-name-pattern: "q.cris.booking.reply.{instanceId}"
+      recreate-on-reconnect: true
+      canary-on-reconnect: true
+      wait-for-endpoint: 15s
+      quota-mb: 100
+
+    replier:
+      queue: q.cris.booking.seatReserve
+      topics:
+        - "cris/booking/seatReserve/request/v1/>"
+      access-type: NON_EXCLUSIVE
+      concurrency: 4
+      provision:
+        # Safe to ship enabled: a drifted queue fails startup naming the property, rather than
+        # being silently accepted. Verified by the spike in spike/README.md.
+        mode: CREATE_IF_MISSING
+        quota-mb: 2000
+        max-redelivery: 3
+        respects-ttl: true
+        discard-notify-sender: true
+      partitioning:
+        # 0 is a flat queue: simplest, no SEMP, and no loss of selectors, browsing or replay.
+        # Above 0 requires SEMP, because JCSMP cannot express a partition count at any version.
+        partition-count: 0
+        rebalance-delay: 5s
+        rebalance-max-handoff-time: 3s
+        allow-partition-resize: false
+        semp:
+          url: ${SEMP_URL:}
+          username: ${SEMP_USER:}
+          password: ${SEMP_PASS:}
+          msg-vpn: ${SOLACE_VPN:default}
+
+booking:
+  topics:
+    request-pattern: "cris/booking/seatReserve/request/v1/{zone}/{trainNo}"
+    request-subscription: "cris/booking/seatReserve/request/v1/>"
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics
+  endpoint:
+    health:
+      show-details: always
+
+logging:
+  level:
+    com.solace.samples: INFO

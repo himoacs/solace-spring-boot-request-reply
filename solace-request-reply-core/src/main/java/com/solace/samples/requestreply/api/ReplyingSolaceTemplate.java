@@ -1,0 +1,58 @@
+package com.solace.samples.requestreply.api;
+
+import java.time.Duration;
+
+/**
+ * Requestor-side API, named after Spring Kafka's {@code ReplyingKafkaTemplate}.
+ *
+ * <p>Solace messages have no key, so the reply type moves to the method rather than the
+ * class, matching Spring Kafka's own {@code ParameterizedTypeReference} overloads. The
+ * {@code partitionKey} argument plays exactly the role a Kafka record key plays: it selects
+ * the partition and therefore the ordering group.
+ */
+public interface ReplyingSolaceTemplate {
+
+    /**
+     * Publishes {@code request} to {@code topic} and returns a future for the reply.
+     *
+     * @param topic        request topic
+     * @param partitionKey partition key, or {@code null} for none. Ignored by a flat queue,
+     *                     so it is safe — and recommended — to always supply one: enabling
+     *                     partitioning later then needs no application change.
+     * @param payload      request body; serialized by the configured converter
+     * @param replyType    type to deserialize the reply into
+     * @param timeout      how long to wait before failing with {@code RequestTimeoutException}
+     */
+    <T, R> RequestReplyFuture<R> sendAndReceive(String topic, String partitionKey, T payload,
+                                                Class<R> replyType, Duration timeout);
+
+    /** As above, with the partition key taken from the configured expression. */
+    default <T, R> RequestReplyFuture<R> sendAndReceive(String topic, T payload,
+                                                       Class<R> replyType, Duration timeout) {
+        return sendAndReceive(topic, null, payload, replyType, timeout);
+    }
+
+    /** As above, using the configured default timeout. */
+    default <T, R> RequestReplyFuture<R> sendAndReceive(String topic, T payload, Class<R> replyType) {
+        return sendAndReceive(topic, null, payload, replyType, defaultReplyTimeout());
+    }
+
+    /** Raw form, for callers that manage their own serialization and headers. */
+    RequestReplyFuture<RequestReplyMessage> sendAndReceive(String topic, RequestReplyMessage request,
+                                                          Duration timeout);
+
+    Duration defaultReplyTimeout();
+
+    /**
+     * Blocks until the reply endpoint is provisioned, subscribed and bound.
+     *
+     * <p>The analogue of Spring Kafka's {@code waitForAssignment}, and it addresses the same
+     * race: publishing before the reply path exists means the reply has nowhere to land.
+     *
+     * @return true if ready within {@code timeout}
+     */
+    boolean waitForReplyEndpoint(Duration timeout);
+
+    /** The reply topic this instance publishes as its reply-to. */
+    String replyTopic();
+}

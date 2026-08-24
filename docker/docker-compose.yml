@@ -1,0 +1,28 @@
+# Local Solace PubSub+ broker for the request/reply demo.
+#
+#   docker compose -f docker/docker-compose.yml up -d
+#
+# macOS note: port 55555 is reserved by the OS, so SMF is published on 55565 here.
+# Override with SOLACE_SMF_PORT if you want something else.
+services:
+  solace:
+    image: solace/solace-pubsub-standard:latest
+    container_name: solace-rr
+    shm_size: 2g
+    environment:
+      # Required for the broker's platform detection inside a container.
+      container: docker
+      routername: rrdemo
+      username_admin_globalaccesslevel: admin
+      username_admin_password: admin
+      system_scaling_maxconnectioncount: "1000"
+    ports:
+      - "${SOLACE_SMF_PORT:-55565}:55555"   # SMF  (messaging)
+      - "${SOLACE_SEMP_PORT:-8085}:8080"    # SEMP + broker manager UI
+      - "${SOLACE_SEMPS_PORT:-1945}:1943"   # SEMP over TLS
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf -u admin:admin http://localhost:8080/SEMP/v2/monitor/about/api || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s

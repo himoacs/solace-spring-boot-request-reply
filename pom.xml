@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <parent>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-parent</artifactId>
+    <version>3.5.16</version>
+    <relativePath/>
+  </parent>
+
+  <groupId>com.solace.samples</groupId>
+  <artifactId>solace-spring-boot-request-reply</artifactId>
+  <version>0.1.0-SNAPSHOT</version>
+  <packaging>pom</packaging>
+  <name>Solace Spring Boot Request/Reply</name>
+  <description>Guaranteed-messaging request/reply over Solace JCSMP for Spring Boot,
+    with Spring Kafka-style conventions. Sample code.</description>
+
+  <modules>
+    <module>solace-request-reply-core</module>
+    <module>booking-demo</module>
+  </modules>
+
+  <properties>
+    <java.version>17</java.version>
+    <maven.compiler.release>17</maven.compiler.release>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    <solace-starter.version>5.5.0</solace-starter.version>
+    <testcontainers-solace.version>1.21.4</testcontainers-solace.version>
+    <otel-jcsmp.version>1.2.0</otel-jcsmp.version>
+  </properties>
+
+  <dependencyManagement>
+    <dependencies>
+      <dependency>
+        <groupId>com.solace.spring.boot</groupId>
+        <artifactId>solace-java-spring-boot-starter</artifactId>
+        <version>${solace-starter.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>org.testcontainers</groupId>
+        <artifactId>solace</artifactId>
+        <version>${testcontainers-solace.version}</version>
+        <scope>test</scope>
+      </dependency>
+      <dependency>
+        <groupId>com.solace.samples</groupId>
+        <artifactId>solace-request-reply-core</artifactId>
+        <version>${project.version}</version>
+      </dependency>
+    </dependencies>
+  </dependencyManagement>
+</project>

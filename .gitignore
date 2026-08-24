@@ -1,0 +1,17 @@
+target/
+!.mvn/wrapper/maven-wrapper.jar
+
+# Never commit broker credentials
+config.json
+*.local.yml
+application-local.yml
+
+.idea/
+*.iml
+.vscode/
+.settings/
+.classpath
+.project
+.DS_Store
+*.log
+.claude/
