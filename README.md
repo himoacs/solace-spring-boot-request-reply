@@ -43,6 +43,10 @@ curl -s -X POST http://localhost:8091/api/bookings \
 On macOS, port 55555 is reserved by the operating system, so the broker publishes SMF on port
 55565 instead.
 
+For a guided, step-by-step tour of the demo — the two-stage future, the double-booking guard,
+splitting the two sides across processes, and the latency harness — see
+[booking-demo/README.md](booking-demo/README.md).
+
 ---
 
 ## How it works
@@ -92,23 +96,29 @@ curl -s -X POST localhost:8091/api/bookings -H 'Content-Type: application/json' 
   | jq '{error, publishConfirmed}'
 ```
 
-### Guaranteed delivery introduces a risk of double booking
+### Guaranteed delivery, and the idempotency that completes it
 
-Guaranteed messaging is at-least-once, not exactly-once. On a non-exclusive queue, an unacknowledged
-message is redelivered to another consumer. A replier that reserves a seat and then dies before
-acknowledging will see the same request again, and a naive handler would reserve a second seat.
+Guaranteed messaging is what makes a booking survive a replier crash, a network partition or a broker
+failover. Every request is persisted to the broker's spool and stays there, redelivered as needed,
+until a consumer acknowledges it. No request is silently dropped — which is exactly the property a
+reservation system needs, and the reason this sample uses persistent delivery throughout.
 
-Two things prevent that:
+That guarantee is at-least-once, and redelivery is how it is honoured. If a replier reserves a seat
+and then dies before acknowledging, the broker hands the request to another consumer instead of
+losing it. The work is never lost; it can simply be presented more than once.
+
+Pairing that with an idempotent handler gives you exactly-once *effects* — no message lost, no seat
+reserved twice. It is a small amount of code, and the same combination production booking and
+payment systems are built on:
 
 1. **Idempotent handling.** The correlation id is stored alongside the reservation, and a repeated
    request returns the original reply instead of doing the work again. See
    `SeatInventoryService.reserveOnce`. In a real service, the reservation and that record belong in
    one database transaction with a unique constraint.
-2. **Acknowledge last.** The replier processes the request, publishes the reply, waits for the
-   broker to confirm the reply is spooled, and only then acknowledges the request. If it
-   acknowledged first, a crash in between would lose the request after the work had already
-   happened. The seat would be taken and the customer told the booking failed, with nothing left to
-   redeliver.
+2. **Acknowledge last.** The replier processes the request, publishes the reply, waits for the broker
+   to confirm the reply is spooled, and only then acknowledges the request. That ordering is what
+   keeps the broker's copy authoritative: until the reply is safely stored, the request is still on
+   the queue and still redeliverable, so a crash anywhere in between costs nothing.
 
 ---
 
