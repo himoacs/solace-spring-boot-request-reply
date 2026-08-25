@@ -1,6 +1,10 @@
 target/
 !.mvn/wrapper/maven-wrapper.jar
 
+# Local Kubernetes setup: manifests, image build and notes for running the demo on a personal
+# minikube. Environment-specific (the broker address is one machine's), so kept out of the repo.
+k8s/
+
 # Never commit broker credentials
 config.json
 *.local.yml
