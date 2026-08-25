@@ -24,7 +24,15 @@ solace:
     # A readable client name makes this application identifiable in the broker's
     # client list, which matters during a support call. Defaults to a generated
     # value that tells an operator nothing.
-    client-name: ${HOSTNAME:my-app}
+    #
+    # The suffix is what keeps it unique. A Message VPN permits one client per
+    # name, so two instances sharing one evict each other and reconnect in a
+    # loop: the session churns, nothing completes, and no log line names the
+    # cause. HOSTNAME is the pod name on Kubernetes and is typically unset on a
+    # developer machine, which is precisely where several instances share a host.
+    # Spring resolves ${random.*} once at binding, so the name is stable for the
+    # life of the session.
+    client-name: ${HOSTNAME:my-app}-${random.int[1000,9999]}
 
     connect-retries: 1
     connect-retries-per-host: 5
