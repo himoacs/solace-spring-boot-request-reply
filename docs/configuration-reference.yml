@@ -90,10 +90,21 @@ solace:
     # -------------------------------------------------- this instance's replies
     reply:
 
+      # Both are production-viable; this is a trade, not a ladder.
+      #
       # TEMPORARY needs no provisioning and leaves nothing behind, which makes a
-      # first run simple. DURABLE is recommended for production, because its
-      # subscription is a broker-side object and survives reconnects; it needs a
-      # stable instance id and a plan for draining orphaned queues.
+      # first run simple and keeps maintenance at zero: no endpoint to declare,
+      # none to clean up. Its subscription is client-side state, so it must be
+      # reapplied if the broker destroys the queue past its linger window --
+      # which recreate-on-reconnect does and canary-on-reconnect verifies.
+      #
+      # DURABLE keeps the subscription as a broker-side object that survives on
+      # its own, and the queue keeps spooling replies while the requestor is
+      # disconnected instead of discarding them. In exchange it wants a stable
+      # instance id and a plan for draining orphaned queues.
+      #
+      # Choose on whether replies must survive a requestor outage, and whether
+      # your operational model prefers endpoints declared up front.
       endpoint-type: TEMPORARY           # TEMPORARY | DURABLE
 
       # The reply topic. {placeholders} are substituted; see the two lists below.
@@ -204,11 +215,16 @@ solace:
         rebalance-delay: 5s
         rebalance-max-handoff-time: 3s
 
-        # Permit changing the partition count on an existing queue. Off by
-        # default, and deliberately so: Solace requires the queue to be drained
-        # first, and reducing the count deletes the messages held in the removed
-        # partitions. Leaving this off turns a mismatch into a startup failure
-        # rather than silent data loss during a redeploy.
+        # This library's own guard, not a Solace setting -- the broker's queue
+        # object exposes only partitionCount, partitionRebalanceDelay and
+        # partitionRebalanceMaxHandoffTime. What it controls is what this
+        # library does when the live partitionCount differs from the configured
+        # one: fail startup, or PATCH the queue over SEMP.
+        #
+        # Off by default, and deliberately so: Solace requires the queue to be
+        # drained first, and reducing the count deletes the messages held in the
+        # removed partitions. Leaving this off turns a mismatch into a startup
+        # failure rather than silent data loss during a redeploy.
         allow-partition-resize: false
 
         # Only consulted when partition-count is above 0. These are management

@@ -45,8 +45,11 @@ solace:
 
     reply:
       # TEMPORARY needs no provisioning and leaves nothing behind, which is why it is the
-      # default. DURABLE is recommended for production: its subscription is a broker-side
-      # object and survives reconnects outright.
+      # default -- and, with recreate-on-reconnect and canary-on-reconnect below, a sound
+      # production choice in its own right. DURABLE is the alternative rather than the
+      # upgrade: a broker-side subscription that survives on its own, and a queue that keeps
+      # spooling replies while the requestor is disconnected, in exchange for owning its
+      # lifecycle.
       endpoint-type: TEMPORARY
       topic-pattern: "cris/booking/seatReserve/reply/v1/{zone}/{trainNo}/{instanceId}"
       # trainNo is filled in per request and wildcarded in the subscription, so one
@@ -85,6 +88,9 @@ solace:
         partition-count: 0
         rebalance-delay: 5s
         rebalance-max-handoff-time: 3s
+        # This library's own guard, not a broker setting: the queue object has only
+        # partitionCount, partitionRebalanceDelay and partitionRebalanceMaxHandoffTime.
+        # It decides whether a count mismatch is a startup failure or a SEMP resize.
         allow-partition-resize: false
         semp:
           url: ${SEMP_URL:}

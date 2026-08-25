@@ -164,9 +164,50 @@ The requestor subscribes **once**, with a wildcard in the train-number position,
 it only echoes what it was given.
 
 The payoff is that the train number is visible in the topic, so you can measure latency per train,
-or tap one train during an incident, without parsing payloads. Configured by
-`reply.per-request-placeholders` plus a matching `per-request-placeholder-expressions` entry in
-[application.yml](src/main/resources/application.yml).
+or tap one train during an incident, without parsing payloads.
+
+#### How that is configured
+
+The reply topic pattern holds three kinds of placeholder, and they resolve at different times:
+
+```yaml
+reply:
+  topic-pattern: "cris/booking/seatReserve/reply/v1/{zone}/{trainNo}/{instanceId}"
+  placeholders:
+    zone: nr                       # static
+  per-request-placeholders:
+    - trainNo                      # wildcarded in the subscription...
+  per-request-placeholder-expressions:
+    trainNo: "trainNo()"           # ...and filled per publish from the payload
+```
+
+| Placeholder | Resolved | In the subscription | In each reply-to |
+|---|---|---|---|
+| `{zone}` | once at startup, from `placeholders` | `nr` | `nr` |
+| `{instanceId}` | once at startup: hostname plus a random suffix | `<host>-4c31ba46` | `<host>-4c31ba46` |
+| `{trainNo}` | on every publish, from the expression | `*` | `12951` |
+
+The two `per-request-*` properties do different jobs, which is why you need both:
+
+- **`per-request-placeholders`** is the list that makes a level a `*` in the subscription. Naming
+  `trainNo` here is what lets one subscription cover every train.
+- **`per-request-placeholder-expressions`** supplies the value for one publish. The expression is
+  SpEL, parsed once at startup and evaluated with the **request payload as the root object** — so
+  `trainNo()` invokes `BookingRequest.trainNo()`. Anything valid against the payload works:
+  a getter, a field, `seatClass().code()`, a literal. The result is carried to the publish on an
+  internal `rr_rt_<name>` header. (With the raw `sendAndReceive(topic, RequestReplyMessage, timeout)`
+  API you can skip expressions and set a header named `<name>` yourself.)
+
+Two failure modes are worth knowing, and they are deliberately different in severity:
+
+- **A name listed with no expression**, or an expression that throws or returns null, renders that
+  level as `unknown` and logs a warning. The subscription still matches, because the level is
+  wildcarded — so you lose the observability, not the reply. Non-fatal on purpose.
+- **A `{placeholder}` in neither map** fails at startup, naming the placeholder and telling you to
+  either give it a static value or declare it per-request. Fatal on purpose: it would otherwise build
+  a subscription containing a literal `{name}` that matches nothing, and every request would time out.
+
+See [application.yml](src/main/resources/application.yml) for the values this demo uses.
 
 This is also the replacement for a JMS selector such as `hostname = '${HOSTNAME}'`. The
 discriminator lives in the topic, so the broker sends only what this instance asked for instead of
@@ -398,9 +439,6 @@ They competed for messages on one shared non-exclusive queue — that queue *is*
 Solace equivalent of a Kafka `groupId`. No rebalance, no partition reassignment, no restart: the new
 instance began taking work the moment its flow bound.
 
-This is also why the request side uses a queue rather than a direct topic subscription. With a topic
-subscription, **every** replier would receive **every** request and reserve a seat each.
-
 ---
 
 ## Step 11: The reply-path health check
@@ -442,9 +480,16 @@ curl -s http://localhost:8091/actuator/health | jq '.components.solaceReplyPath'
 }
 ```
 
-`recreate-on-reconnect` redoes the sequence after a reconnect; `canary-on-reconnect` then proves it
-with a real message. Using `endpoint-type: DURABLE` avoids the problem altogether, and is the
-production recommendation.
+`recreate-on-reconnect` redoes the sequence after a reconnect, and `canary-on-reconnect` then proves
+it with a real message. Between them the failure is handled and, more importantly, *visible* — which
+is what makes `TEMPORARY` a perfectly sound production choice, and a low-maintenance one: nothing to
+provision, nothing left behind, no queue lifecycle to own.
+
+`DURABLE` is the alternative, not the upgrade. It trades that zero maintenance for a broker-side
+subscription that survives on its own, and for a queue that keeps spooling replies while the
+requestor is disconnected instead of discarding them. Pick it when you want replies to survive a
+requestor outage, or when your operational model prefers endpoints declared up front; stay on
+`TEMPORARY` when you would rather own no endpoint at all.
 
 ---
 

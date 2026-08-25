@@ -226,7 +226,7 @@ if it does not exist.
 
 | Setting | Default | Why it matters |
 |---|---|---|
-| `reply.endpoint-type` | `TEMPORARY` | Temporary queues need no provisioning and leave nothing behind. Use `DURABLE` in production, because its subscription is a broker-side object and survives reconnects. |
+| `reply.endpoint-type` | `TEMPORARY` | Both are production-viable. `TEMPORARY` needs no provisioning, leaves nothing behind and is the lower-maintenance option; the reconnect handling below is what makes it safe. `DURABLE` keeps the subscription as a broker-side object and spools replies while the requestor is disconnected, at the cost of owning a queue's lifecycle. |
 | `replier.partitioning.partition-count` | `0` (flat) | A flat queue needs no SEMP access and keeps selectors, queue browsing and replay, but gives no ordering. Above zero serialises requests that share a partition key. |
 | `request.ttl-matches-timeout` | `true` | Stops a replier acting on a request after the requestor has given up. Turning it off can produce work nobody is waiting for. |
 | `replier.provision.max-redelivery` | `3` | Zero means redeliver forever, so one malformed message loops indefinitely. |
@@ -248,7 +248,15 @@ come back, which is the only check that proves a message can actually complete t
 result is reported through the reply-path health indicator, so a readiness probe can remove the
 instance rather than leaving it to accept requests it cannot answer.
 
-Using `DURABLE` avoids the problem entirely.
+Handled, and — the part that matters — *visible*: the canary turns a silent failure into a health
+check a readiness probe can act on. `TEMPORARY` is a sound production choice on that basis, and the
+lower-maintenance one, since there is no endpoint to provision or clean up.
+
+`DURABLE` sidesteps this particular sequence, because the subscription is a broker-side object that
+does not need reapplying, and a durable queue also keeps spooling replies while the requestor is
+disconnected rather than discarding them. That is a different trade, not a better default: you take
+on the queue's lifecycle in exchange. Choose on whether you want replies to survive a requestor
+outage and whether your operational model prefers endpoints declared up front.
 
 ### Provisioning modes
 
