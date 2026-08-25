@@ -51,6 +51,9 @@ public class SolaceMessageListenerContainer implements AutoCloseable {
     private final SolaceListenerErrorHandler errorHandler;
     private final ExecutorService handlerExecutor;
     private final TracingContextBridge tracing;
+    private final boolean replyDmqEligible;
+    /** Resolved once at construction, not per message: "unset" already means request.timeout. */
+    private final long replyTtlMillis;
 
     private final List<FlowConsumer> flows = new ArrayList<>();
     private volatile Queue queue;
@@ -64,7 +67,9 @@ public class SolaceMessageListenerContainer implements AutoCloseable {
                                           HandlerMethodInvoker invoker,
                                           SolaceListenerErrorHandler errorHandler,
                                           ExecutorService handlerExecutor,
-                                          TracingContextBridge tracing) {
+                                          TracingContextBridge tracing,
+                                          boolean replyDmqEligible,
+                                          long replyTtlMillis) {
         this.endpoint = endpoint;
         this.session = session;
         this.provisioner = provisioner;
@@ -74,6 +79,8 @@ public class SolaceMessageListenerContainer implements AutoCloseable {
         this.errorHandler = errorHandler;
         this.handlerExecutor = handlerExecutor;
         this.tracing = tracing;
+        this.replyDmqEligible = replyDmqEligible;
+        this.replyTtlMillis = replyTtlMillis;
     }
 
     public synchronized void start() {
@@ -149,8 +156,11 @@ public class SolaceMessageListenerContainer implements AutoCloseable {
         }
 
         PublishTicket ticket = new PublishTicket(request.getCorrelationId(), destination, System.nanoTime());
+        // A reply outlives its usefulness the moment the requestor's future gives up, so it
+        // carries a TTL and dead-letters rather than accumulating in an orphaned reply queue.
+        reply.setDmqEligible(replyDmqEligible);
         try {
-            publisher.publish(destination, reply, ticket, 0L);
+            publisher.publish(destination, reply, ticket, replyTtlMillis);
             // Ack only once the broker confirms the reply is spooled. Anything earlier risks
             // losing the request while the work is already done.
             ticket.sendFuture().whenComplete((res, err) -> {

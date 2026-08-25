@@ -10,6 +10,7 @@ import com.solace.samples.requestreply.core.PayloadCodec;
 import com.solace.samples.requestreply.core.TracingContextBridge;
 import com.solace.samples.requestreply.endpoint.ReplyEndpoint;
 import com.solace.samples.requestreply.endpoint.ReplyEndpointFactory;
+import com.solace.samples.requestreply.endpoint.DmqProvisioner;
 import com.solace.samples.requestreply.endpoint.RequestQueueProvisioner;
 import com.solace.samples.requestreply.endpoint.SempClient;
 import com.solace.samples.requestreply.latency.LatencyRecorder;
@@ -156,6 +157,19 @@ public class SolaceRequestReplyAutoConfiguration {
         return new SempClient(props.getReplier().getPartitioning());
     }
 
+    /**
+     * Provisioned eagerly at startup rather than lazily on first dead message, because by the
+     * time a message needs the DMQ it is already too late — a missing DMQ means the broker has
+     * deleted it.
+     */
+    @Bean
+    @ConditionalOnMissingBean
+    public DmqProvisioner dmqProvisioner(SolaceSession session, SolaceRequestReplyProperties props) {
+        DmqProvisioner provisioner = new DmqProvisioner(session, props.getDmq());
+        provisioner.ensure();
+        return provisioner;
+    }
+
     @Bean
     @ConditionalOnMissingBean
     public RequestQueueProvisioner requestQueueProvisioner(SolaceSession session,
@@ -203,9 +217,10 @@ public class SolaceRequestReplyAutoConfiguration {
             SolaceSession session, RequestQueueProvisioner provisioner,
             PersistentPublisher publisher, PayloadCodec codec, HandlerMethodInvoker invoker,
             ExecutorService solaceHandlerExecutor, TracingContextBridge tracing,
-            ObjectProvider<SolaceListenerErrorHandler> errorHandlers) {
+            ObjectProvider<SolaceListenerErrorHandler> errorHandlers,
+            SolaceRequestReplyProperties props) {
         return new SolaceListenerRegistrar(postProcessor, session, provisioner, publisher, codec,
-                invoker, solaceHandlerExecutor, tracing, errorHandlers);
+                invoker, solaceHandlerExecutor, tracing, errorHandlers, props);
     }
 
     private static ThreadFactory named(String prefix) {
@@ -230,6 +245,7 @@ public class SolaceRequestReplyAutoConfiguration {
         private final ExecutorService handlerExecutor;
         private final TracingContextBridge tracing;
         private final ObjectProvider<SolaceListenerErrorHandler> errorHandlers;
+        private final SolaceRequestReplyProperties props;
         private final List<SolaceMessageListenerContainer> containers = new ArrayList<>();
 
         SolaceListenerRegistrar(SolaceListenerAnnotationBeanPostProcessor postProcessor,
@@ -237,7 +253,8 @@ public class SolaceRequestReplyAutoConfiguration {
                                 PersistentPublisher publisher, PayloadCodec codec,
                                 HandlerMethodInvoker invoker, ExecutorService handlerExecutor,
                                 TracingContextBridge tracing,
-                                ObjectProvider<SolaceListenerErrorHandler> errorHandlers) {
+                                ObjectProvider<SolaceListenerErrorHandler> errorHandlers,
+                                SolaceRequestReplyProperties props) {
             this.postProcessor = postProcessor;
             this.session = session;
             this.provisioner = provisioner;
@@ -247,6 +264,7 @@ public class SolaceRequestReplyAutoConfiguration {
             this.handlerExecutor = handlerExecutor;
             this.tracing = tracing;
             this.errorHandlers = errorHandlers;
+            this.props = props;
         }
 
         @Override
@@ -256,7 +274,9 @@ public class SolaceRequestReplyAutoConfiguration {
             for (SolaceListenerEndpoint endpoint : postProcessor.endpoints()) {
                 SolaceMessageListenerContainer container = new SolaceMessageListenerContainer(
                         endpoint, session, provisioner, publisher, codec, invoker,
-                        errorHandlers.getIfAvailable(), handlerExecutor, tracing);
+                        errorHandlers.getIfAvailable(), handlerExecutor, tracing,
+                        props.getDmq().isEnabled() && props.getReplier().isDmqEligible(),
+                        props.getReplier().resolveReplyTtlMillis(props.getRequest().getTimeout()));
                 container.start();
                 containers.add(container);
             }

@@ -87,6 +87,14 @@ solace:
       # test detect message loss and out-of-order arrival.
       sequence-numbers: true
 
+      # Marks published requests DMQ-eligible, so one that expires or exhausts
+      # its redeliveries is moved to the dead message queue instead of being
+      # deleted. Required on brokers before 10.25.10, which move only eligible
+      # messages; from 10.25.10 the broker moves everything unless the queue
+      # sets respectDmqEligibleEnabled. Setting it makes both versions behave
+      # the same. Inert unless the DMQ exists -- see the dmq block below.
+      dmq-eligible: true
+
     # -------------------------------------------------- this instance's replies
     reply:
 
@@ -170,6 +178,24 @@ solace:
 
       access-type: NON_EXCLUSIVE         # NON_EXCLUSIVE | EXCLUSIVE
 
+      # Marks published replies DMQ-eligible. See request.dmq-eligible above.
+      dmq-eligible: true
+
+      # TTL on published replies. UNSET MEANS "FOLLOW request.timeout", which is
+      # the default; 0s disables expiry entirely.
+      #
+      # A reply is only useful to the one requestor instance whose future is
+      # waiting, and that future has a deadline -- past it nothing can complete
+      # it. Without a TTL an undeliverable reply sits in the reply queue for
+      # ever, which is how a durable reply queue belonging to a pod that has
+      # been rescheduled quietly fills up.
+      #
+      # It derives from the request timeout rather than defaulting to a fixed
+      # duration deliberately: a hard-coded value would begin expiring replies
+      # while requestors were still waiting the moment anyone raised
+      # request.timeout.
+      # reply-ttl: 5s
+
       # Flows bound to the queue by this instance, and the size of the handler
       # thread pool.
       concurrency: 4
@@ -236,6 +262,37 @@ solace:
           username: ""
           password: ""
           msg-vpn: default
+
+    # ------------------------------------------------------ dead message queue
+    dmq:
+
+      # On by default, because the alternative is that the broker DELETES a
+      # message it failed to deliver: a request lost with nothing anywhere
+      # recording that it existed.
+      #
+      # Provisioning failure is a warning rather than a startup error, since
+      # this is on by default and a restricted client profile must not take the
+      # application down. The cost of failing is the old behaviour -- discard.
+      enabled: true
+
+      # One shared queue rather than a DMQ per endpoint. #DEAD_MSG_QUEUE is the
+      # Message VPN default that every queue already points at, so this needs no
+      # SEMP access at all. Naming anything else would additionally require
+      # setting deadMsgQueue on each source queue over SEMP, and temporary reply
+      # queues cannot carry that setting -- they are not SEMP-configurable
+      # objects. Dead-lettered messages keep their original topic, so requests
+      # and replies remain easy to tell apart on inspection.
+      name: "#DEAD_MSG_QUEUE"
+
+      # Create it at startup when missing. Turn off if it is provisioned out of
+      # band; nothing is verified in that case, because a client without
+      # management access cannot tell "missing" from "not visible to me".
+      provision: true
+
+      # Provisioned with respectsMsgTTL=false regardless of this: these messages
+      # are here BECAUSE they expired, and honouring their TTL again would expire
+      # them straight back out of the one place they are meant to survive.
+      quota-mb: 1000
 
     # --------------------------------------------------------------- tracing
     tracing:

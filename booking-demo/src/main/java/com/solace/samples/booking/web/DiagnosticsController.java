@@ -5,6 +5,7 @@ import com.solace.samples.requestreply.api.ReplyingSolaceTemplate;
 import com.solace.samples.requestreply.config.SolaceRequestReplyProperties;
 import com.solace.samples.requestreply.core.CorrelationStore;
 import com.solace.samples.requestreply.core.TracingContextBridge;
+import com.solace.samples.requestreply.endpoint.DmqProvisioner;
 import com.solace.samples.requestreply.endpoint.ReplyEndpoint;
 import com.solace.samples.requestreply.transport.SolaceSession;
 import org.springframework.beans.factory.ObjectProvider;
@@ -33,12 +34,14 @@ public class DiagnosticsController {
     private final CorrelationStore store;
     private final ObjectProvider<SeatInventoryService> inventory;
     private final TracingContextBridge tracing;
+    private final DmqProvisioner dmq;
 
     public DiagnosticsController(SolaceSession session, ReplyEndpoint replyEndpoint,
                                  ReplyingSolaceTemplate template,
                                  SolaceRequestReplyProperties props, CorrelationStore store,
                                  ObjectProvider<SeatInventoryService> inventory,
-                                 TracingContextBridge tracing) {
+                                 TracingContextBridge tracing,
+                                 DmqProvisioner dmq) {
         this.session = session;
         this.replyEndpoint = replyEndpoint;
         this.template = template;
@@ -46,6 +49,7 @@ public class DiagnosticsController {
         this.store = store;
         this.inventory = inventory;
         this.tracing = tracing;
+        this.dmq = dmq;
     }
 
     @GetMapping("/endpoints")
@@ -86,6 +90,19 @@ public class DiagnosticsController {
         SeatInventoryService inv = inventory.getIfAvailable();
         if (inv != null) { flight.put("distinctReservations", inv.reservationCount()); }
         out.put("inFlight", flight);
+
+        Map<String, Object> d = new LinkedHashMap<>();
+        d.put("configuredEnabled", props.getDmq().isEnabled());
+        // Separate from the flag for the same reason tracing is: dead-lettering can be switched
+        // on and still be inert, because a DMQ that does not exist means the broker deletes.
+        d.put("established", dmq.isEstablished());
+        d.put("queue", dmq.queueName());
+        d.put("detail", dmq.detail());
+        d.put("requestsEligible", props.getRequest().isDmqEligible());
+        d.put("repliesEligible", props.getReplier().isDmqEligible());
+        d.put("replyTtlMillis",
+                props.getReplier().resolveReplyTtlMillis(props.getRequest().getTimeout()));
+        out.put("dmq", d);
 
         Map<String, Object> tr = new LinkedHashMap<>();
         tr.put("configuredEnabled", props.getTracing().isEnabled());

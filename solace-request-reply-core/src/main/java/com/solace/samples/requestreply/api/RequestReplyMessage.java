@@ -23,6 +23,13 @@ public final class RequestReplyMessage {
 
     private boolean error;
     private String errorMessage;
+    /**
+     * Whether the broker may move this message to the dead message queue rather than deleting
+     * it once it exhausts redelivery or expires. Off by default, matching JCSMP: the request
+     * and reply paths opt in from configuration, while the reply-path canary deliberately does
+     * not, since it carries a TTL and would otherwise dead-letter a probe on every reconnect.
+     */
+    private boolean dmqEligible;
 
     private final Map<String, String> headers = new LinkedHashMap<>();
 
@@ -63,6 +70,10 @@ public final class RequestReplyMessage {
     public Long getSequence() { return sequence; }
 
     public RequestReplyMessage setSequence(Long v) { this.sequence = v; return this; }
+
+    public boolean isDmqEligible() { return dmqEligible; }
+
+    public RequestReplyMessage setDmqEligible(boolean v) { this.dmqEligible = v; return this; }
 
     public boolean isError() { return error; }
 

@@ -22,9 +22,10 @@ For the library's design and configuration reference, see the [root README](../R
 | [5](#step-5-ask-what-was-actually-provisioned) | What the library actually provisioned, versus what you configured |
 | [6–7](#step-6-the-two-stage-future-publish-versus-reply) | The two-stage future: telling a publish failure apart from an unanswered request |
 | [8](#step-8-the-double-booking-guard) | The double-booking guard under at-least-once delivery |
-| [9–10](#step-9-split-the-two-sides-into-separate-processes) | Splitting requestor and replier, then scaling repliers out |
-| [11](#step-11-the-reply-path-health-check) | The reply-path health check that catches a silent failure mode |
-| [12](#step-12-measure-latency) | Exact latency percentiles with a segment breakdown |
+| [9](#step-9-nothing-is-lost-when-a-request-expires) | Dead-lettering: an expired request kept for inspection instead of deleted |
+| [10–11](#step-10-split-the-two-sides-into-separate-processes) | Splitting requestor and replier, then scaling repliers out |
+| [12](#step-12-the-reply-path-health-check) | The reply-path health check that catches a silent failure mode |
+| [13](#step-13-measure-latency) | Exact latency percentiles with a segment breakdown |
 
 ---
 
@@ -361,7 +362,104 @@ Two mechanisms produce that, both in [SeatInventoryService.java](src/main/java/c
 
 ---
 
-## Step 9: Split the two sides into separate processes
+## Step 9: Nothing is lost when a request expires
+
+Guaranteed delivery keeps a request safe right up to the point the broker gives up on it. When a
+request exhausts its redeliveries, or its TTL expires, the broker's choice is to **delete** it or to
+move it to a dead message queue. Deleting means a booking vanishes with nothing anywhere recording
+that it existed, so the demo enables dead-lettering.
+
+You need a request that nobody consumes — so start the demo with the replier switched off. (Step 10
+covers the profiles properly; here it is just a way to leave the request queue unattended.)
+
+```bash
+# Stop the running demo first.
+java -jar booking-demo/target/booking-demo-0.1.0-SNAPSHOT.jar \
+  --spring.profiles.active=requestor &
+```
+
+At startup the DMQ is provisioned:
+
+```
+DmqProvisioner : Dead message queue '#DEAD_MSG_QUEUE' provisioned/verified: quota=1000MB respectsTtl=false
+```
+
+`respectsTtl=false` on that queue is deliberate. These messages arrive *because* they expired;
+honouring their TTL a second time would expire them straight back out of the one place they are
+meant to survive.
+
+Now send a booking nothing will handle. It returns 504 after the 5s timeout, exactly as in step 6:
+
+```bash
+curl -s -X POST http://localhost:8091/api/bookings -H 'Content-Type: application/json' \
+  -d '{"zone":"nr","trainNo":"19999","journeyDate":"2026-12-25","seatClass":"AC1",
+       "passengerName":"Dead Letter Test","passengers":1}' | jq '{error, publishConfirmed}'
+```
+
+The difference is what is left behind. Wait a few seconds, then look in the DMQ:
+
+```bash
+curl -s -u admin:admin \
+  'http://localhost:8085/SEMP/v2/monitor/msgVpns/default/queues/%23DEAD_MSG_QUEUE/msgs' \
+  | jq -r '.data[] | "dmqEligibleAsPublished=\(.dmqEligibleAsPublished) ttl=\(.ttl) redeliveryCount=\(.redeliveryCount)"'
+```
+
+```
+dmqEligibleAsPublished=true ttl=5000 redeliveryCount=0
+```
+
+Three things to read there. `dmqEligibleAsPublished=true` is the flag the requestor set, which is
+what makes this work on brokers before 10.25.10. `ttl=5000` is the request timeout, applied by
+`ttl-matches-timeout`. `redeliveryCount=0` says it expired rather than being retried to exhaustion —
+nothing ever picked it up.
+
+The request queue is now empty: the message was **moved**, not copied.
+
+```bash
+curl -s -u admin:admin \
+  'http://localhost:8085/SEMP/v2/monitor/msgVpns/default/queues/q.cris.booking.seatReserve/msgs' \
+  | jq '.data | length'      # 0
+```
+
+### What does not go to the DMQ
+
+This is the part worth internalising, because a message you expect to find and cannot is confusing.
+
+| Situation | Dead-lettered? |
+|---|---|
+| Request expires with nothing consuming it — what you just did | yes |
+| Replier crashes before acknowledging, past `max-redelivery` | yes |
+| Reply published after the requestor has gone, once `reply-ttl` elapses | yes |
+| `"simulate":"remote-error"` — the handler throws | **no** — it becomes an error reply, and the request is acknowledged |
+| `"simulate":"timeout"` — the handler returns `null` | **no** — it declines to reply but still acknowledges |
+| The reply-path canary from step 12 | **no** — deliberately ineligible, or every reconnect would leave one |
+
+"The requestor timed out" and "the request was dead-lettered" are different events. `simulate=timeout`
+produces the first without the second: a handler that runs to completion and simply says nothing has
+consumed the request perfectly legitimately, so there is nothing left to dead-letter.
+
+Replies carry a TTL too, defaulting to `request.timeout` — visible as `replyTtlMillis` in
+`/api/diagnostics/endpoints`, alongside whether the DMQ was actually established:
+
+```bash
+curl -s http://localhost:8091/api/diagnostics/endpoints | jq '.dmq'
+```
+
+```json
+{
+  "configuredEnabled": true, "established": true,
+  "queue": "#DEAD_MSG_QUEUE", "detail": "provisioned/verified",
+  "requestsEligible": true, "repliesEligible": true, "replyTtlMillis": 5000
+}
+```
+
+`configuredEnabled` and `established` are separate for the same reason they are under `tracing`:
+dead-lettering can be switched on and still be inert, because a DMQ that could not be created means
+the broker goes back to deleting.
+
+---
+
+## Step 10: Split the two sides into separate processes
 
 Nothing about the demo requires both sides in one JVM. They are independent beans over separate
 queues, so splitting them needs no code change — only profiles.
@@ -416,7 +514,7 @@ holds the waiting future, because the reply topic names that instance.
 
 ---
 
-## Step 10: Scale the repliers out
+## Step 11: Scale the repliers out
 
 Add a second replier against the same queue:
 
@@ -441,7 +539,7 @@ instance began taking work the moment its flow bound.
 
 ---
 
-## Step 11: The reply-path health check
+## Step 12: The reply-path health check
 
 There is a failure mode worth knowing about. A temporary reply queue survives a disconnect for 60
 seconds, or 180 across a failover. Past that the broker destroys it — and when the client reconnects,
@@ -493,7 +591,7 @@ requestor outage, or when your operational model prefers endpoints declared up f
 
 ---
 
-## Step 12: Measure latency
+## Step 13: Measure latency
 
 One command runs a test, prints a report, and exits. No metrics backend required.
 

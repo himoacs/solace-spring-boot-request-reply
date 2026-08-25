@@ -231,6 +231,8 @@ if it does not exist.
 | `request.ttl-matches-timeout` | `true` | Stops a replier acting on a request after the requestor has given up. Turning it off can produce work nobody is waiting for. |
 | `replier.provision.max-redelivery` | `3` | Zero means redeliver forever, so one malformed message loops indefinitely. |
 | `java.reconnect-retries` | — | Set this to at least 100 with a 3000 ms wait, which gives the 300 seconds needed to survive an HA failover. The commonly copied value of 20 only gives 60 seconds. |
+| `dmq.enabled` | `true` | On, because the alternative is deleting a message the system failed to process. Turning it off restores silent discard. |
+| `replier.reply-ttl` | follows `request.timeout` | Bounds how long an undeliverable reply lingers. Set `0s` to keep replies forever, at the cost of orphaned queues growing. |
 | `tracing.enabled` | `false` | See [Distributed tracing](#distributed-tracing). |
 
 ### The temporary queue hazard
@@ -275,47 +277,93 @@ first and reducing the count deletes the messages held in the removed partitions
 
 ### Dead message queues
 
-**This library does not currently wire up a DMQ.** What it sets on the request queue is the
-redelivery and expiry policy around one:
+A message that exhausts `replier.provision.max-redelivery`, or whose TTL expires, would otherwise be
+**deleted** — a lost booking with no trace. Dead-lettering keeps it somewhere inspectable instead.
+It is on by default, because the alternative is silent loss.
 
-| Property | Default | Maps to |
-|---|---|---|
-| `replier.provision.max-redelivery` | `3` | `maxMsgRedelivery` — attempts before the broker gives up on a message |
-| `replier.provision.respects-ttl` | `true` | `respectsMsgTTL` — whether the queue honours a message's TTL |
-| `replier.provision.discard-notify-sender` | `true` | `discardBehavior` — nack the publisher when the queue discards |
-
-A Solace broker moves a message to a dead message queue when it exceeds `maxMsgRedelivery` or its TTL
-expires — but only if **both** of these hold, and neither does here:
-
-1. **The message is marked DMQ-eligible by the publisher.** JCSMP defaults `setDMQEligible` to
-   `false`, and this library never sets it.
-2. **The DMQ exists.** The queue's `deadMsgQueue` attribute already points at `#DEAD_MSG_QUEUE` by
-   default, but nothing creates that queue. JCSMP's `EndpointProperties` has no DMQ member at any
-   version, so — exactly as with `partitionCount` — it has to come from SEMP or out-of-band
-   provisioning.
-
-The consequence is worth stating plainly: today, a request that exhausts its three redeliveries, or
-whose TTL expires, is **silently discarded**. For a booking system that is a lost request with no
-forensic trail.
-
-Before turning it on, note how it interacts with `request.ttl-matches-timeout`. That setting gives
-every request a TTL equal to the reply timeout, and TTL expiry is a DMQ path just as redelivery
-exhaustion is. Marking every request DMQ-eligible would therefore fill the DMQ with ordinary
-timeouts — requests the requestor has already given up on and reported — mixed in with the genuine
-poison messages you actually want to inspect. The two failures deserve different treatment, so this
-is a design decision rather than a flag to flip.
-
-If you want a DMQ in the meantime, provision it out of band and mark your requests eligible:
-
-```bash
-curl -u admin:admin -X POST http://localhost:8085/SEMP/v2/config/msgVpns/default/queues \
-  -H 'Content-Type: application/json' \
-  -d '{"queueName":"#DEAD_MSG_QUEUE","accessType":"non-exclusive",
-       "permission":"consume","ingressEnabled":true,"egressEnabled":true}'
+```yaml
+solace:
+  request-reply:
+    dmq:
+      enabled: true               # mark messages eligible and provision the queue
+      name: "#DEAD_MSG_QUEUE"     # the Message VPN default, which every queue already points at
+      provision: true             # create it at startup when missing
+      quota-mb: 1000
+    request:
+      dmq-eligible: true          # flag on published requests
+    replier:
+      dmq-eligible: true          # flag on published replies
+      reply-ttl:                  # unset: follow request.timeout. 0s disables expiry.
 ```
 
-Eligibility is per message and has no property yet, so it needs a line in the publisher
-(`XMLMessage.setDMQEligible(true)`).
+**One shared queue, deliberately.** A DMQ per endpoint would need `deadMsgQueue` set on each source
+queue over SEMP, and temporary reply queues cannot carry that setting at all — they are not
+SEMP-configurable objects. Every queue already points at `#DEAD_MSG_QUEUE`, so using it needs no
+management credentials and behaves identically for temporary and durable reply endpoints.
+Dead-lettered messages keep their original topic, so `…/request/v1/…` and `…/reply/v1/…` remain easy
+to tell apart when you inspect the queue.
+
+The DMQ is provisioned with `respectsMsgTTL=false`. These messages are here *because* they expired;
+honouring their TTL again would expire them straight back out of the one place they are meant to
+survive.
+
+**Provisioning failure is a warning, not a crash.** Since this is on by default, a restricted client
+profile or a DMQ owned by another team must not take the application down. You get one warning
+naming the queue, and the behaviour that existed before the feature: dead messages are discarded.
+
+### What actually reaches the DMQ
+
+Less obvious than it looks, and worth knowing before you go hunting for a message that is not there.
+
+| Situation | Dead-lettered? |
+|---|---|
+| Request expires on the queue with no replier consuming it | yes |
+| Request redelivered past `max-redelivery` — a replier crashing before it acknowledges | yes |
+| Reply published, requestor already gone, `reply-ttl` elapsed | yes |
+| Handler throws | **no** — that becomes an error reply, and the request is acknowledged |
+| Handler returns `null` (the demo's `simulate=timeout`) | **no** — it declines to reply but still acknowledges |
+| Reply-path canary probe | **no** — deliberately ineligible, or every reconnect would deposit one |
+
+The last three are the ones that surprise people. "The requestor timed out" and "the request was
+dead-lettered" are different events: a handler that runs to completion and simply says nothing has
+consumed the request quite legitimately, so there is nothing left to dead-letter.
+
+### Broker version affects this
+
+On brokers **10.25.10 and later**, *all* messages removed from a queue go to the DMQ, and a queue's
+`respectDmqEligibleEnabled` restores the older behaviour. On **10.25.9 and earlier**, only messages
+the publisher marked eligible are moved. Setting the flag is what makes behaviour the same on both,
+which is why `dmq-eligible` exists rather than relying on the broker default.
+
+One consequence worth stating: on a modern broker, `dmq.enabled=false` stops *this library* marking
+messages and provisioning the queue, but if the DMQ already exists the broker may still move messages
+into it. To make the publisher's flag authoritative there, set `respectDmqEligibleEnabled` on the
+source queue over SEMP — this library does not, since it needs no management credentials otherwise.
+
+### Reply TTL
+
+Replies carry a TTL, defaulting to `request.timeout`. A reply is only useful to the one requestor
+instance whose future is waiting; past that deadline no process can complete it, and without a TTL an
+undeliverable reply would sit in the reply queue indefinitely — the orphaned-queue accumulation that
+`DURABLE` reply endpoints are otherwise prone to.
+
+It *derives* from `request.timeout` rather than defaulting to a fixed duration on purpose: a
+hard-coded value would start expiring replies while requestors were still waiting the moment anyone
+raised the timeout. Set `replier.reply-ttl` explicitly to override, or `0s` to disable expiry.
+
+Expect a timed-out request to produce up to two DMQ entries — the expired request and its expired
+reply. That is the intended troubleshooting signal, and the topics tell them apart.
+
+### Inspecting it
+
+```bash
+curl -s -u admin:admin \
+  'http://localhost:8085/SEMP/v2/monitor/msgVpns/default/queues/%23DEAD_MSG_QUEUE/msgs' | jq
+```
+
+`GET /api/diagnostics/endpoints` reports a `dmq` block with `configuredEnabled` and `established`
+separately, for the same reason tracing does: dead-lettering can be switched on and still be inert if
+the queue could not be created.
 
 ---
 
@@ -410,7 +458,7 @@ you replace them with a custom `Executor`, context propagation will stop working
 | Replay | messages are retained by time or size, and you can seek | a queue drains as messages are acknowledged. Reprocessing needs the separate Message Replay feature. |
 | Rebalancing | partitions are reassigned in a stop-the-world rebalance | messages are distributed one at a time across bound flows. Adding an instance takes effect immediately. |
 | Filtering | topic names are flat, so consumers filter in the application | topics are hierarchical and the broker filters per message. |
-| Dead letters | a client-side recoverer republishes to a `.DLT` topic | the broker moves messages to a dead message queue, with no client code involved — but only for messages the publisher marked DMQ-eligible, and only if the DMQ exists. **This library does neither**, so exhausted and expired messages are discarded. See [Dead message queues](#dead-message-queues). |
+| Dead letters | a client-side recoverer republishes to a `.DLT` topic | the broker moves messages to a dead message queue, with no client code involved. On by default here; see [Dead message queues](#dead-message-queues). |
 | Queue browsing | not applicable | not available on a partitioned queue. |
 
 ---

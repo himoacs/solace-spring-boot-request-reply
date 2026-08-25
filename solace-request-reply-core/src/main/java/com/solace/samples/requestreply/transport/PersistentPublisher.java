@@ -73,6 +73,9 @@ public class PersistentPublisher implements AutoCloseable {
             msg.setData(payload == null ? new byte[0] : payload);
             msg.setDeliveryMode(deliveryMode);
             if (ttlMillis > 0) { msg.setTimeToLive(ttlMillis); }
+            // Without this the broker deletes the message once it expires or exhausts
+            // redelivery, rather than moving it to the DMQ. JCSMP defaults it to false.
+            if (message.isDmqEligible()) { msg.setDMQEligible(true); }
 
             if (message.getCorrelationId() != null) { msg.setCorrelationId(message.getCorrelationId()); }
             if (message.getReplyTo() != null) {

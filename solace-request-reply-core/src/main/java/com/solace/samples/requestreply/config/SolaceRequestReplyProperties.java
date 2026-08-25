@@ -27,6 +27,8 @@ public class SolaceRequestReplyProperties {
     private final Replier replier = new Replier();
     @NestedConfigurationProperty
     private final TracingProperties tracing = new TracingProperties();
+    @NestedConfigurationProperty
+    private final Dmq dmq = new Dmq();
 
     public boolean isEnabled() { return enabled; }
     public void setEnabled(boolean enabled) { this.enabled = enabled; }
@@ -34,6 +36,7 @@ public class SolaceRequestReplyProperties {
     public Reply getReply() { return reply; }
     public Replier getReplier() { return replier; }
     public TracingProperties getTracing() { return tracing; }
+    public Dmq getDmq() { return dmq; }
 
     // ------------------------------------------------------------------ request
 
@@ -55,6 +58,16 @@ public class SolaceRequestReplyProperties {
         private String partitionKeyExpression;
         /** Stamp a monotonic sequence number, enabling gap and reorder detection. */
         private boolean sequenceNumbers = true;
+        /**
+         * Mark published requests DMQ-eligible, so a request that exhausts its redeliveries or
+         * outlives its TTL is moved to the dead message queue instead of being discarded.
+         *
+         * <p>Needed for brokers at 10.25.9 and earlier, where only eligible messages are moved.
+         * From 10.25.10 the broker moves everything unless the queue sets
+         * {@code respectDmqEligibleEnabled}, so setting the flag is the behaviour that is
+         * correct on both. It does nothing at all unless the DMQ exists — see {@link Dmq}.
+         */
+        private boolean dmqEligible = true;
 
         public Duration getTimeout() { return timeout; }
         public void setTimeout(Duration v) { this.timeout = v; }
@@ -66,6 +79,8 @@ public class SolaceRequestReplyProperties {
         public void setPartitionKeyExpression(String v) { this.partitionKeyExpression = v; }
         public boolean isSequenceNumbers() { return sequenceNumbers; }
         public void setSequenceNumbers(boolean v) { this.sequenceNumbers = v; }
+        public boolean isDmqEligible() { return dmqEligible; }
+        public void setDmqEligible(boolean v) { this.dmqEligible = v; }
     }
 
     // -------------------------------------------------------------------- reply
@@ -186,6 +201,23 @@ public class SolaceRequestReplyProperties {
         private String accessType = "NON_EXCLUSIVE";
         private int concurrency = 4;
 
+        /** Mark published replies DMQ-eligible. See {@link Request#isDmqEligible()}. */
+        private boolean dmqEligible = true;
+        /**
+         * TTL on published replies. <b>Unset means follow {@code request.timeout}</b>, which is
+         * the default; {@code 0s} disables expiry.
+         *
+         * <p>A reply is only useful to the one requestor instance whose future is waiting, and
+         * that future has a deadline — past it, no process can complete it. Without a TTL an
+         * undeliverable reply sits in the reply queue indefinitely, which is the orphaned-queue
+         * accumulation {@code DurableReplyEndpoint} warns about.
+         *
+         * <p>It derives from the request timeout rather than defaulting to a fixed duration on
+         * purpose: a hard-coded value would expire replies while requestors were still waiting
+         * as soon as anyone raised {@code request.timeout}.
+         */
+        private Duration replyTtl;
+
         @NestedConfigurationProperty
         private final Provision provision = new Provision();
         @NestedConfigurationProperty
@@ -201,6 +233,16 @@ public class SolaceRequestReplyProperties {
         public void setConcurrency(int v) { this.concurrency = v; }
         public Provision getProvision() { return provision; }
         public Partitioning getPartitioning() { return partitioning; }
+        public boolean isDmqEligible() { return dmqEligible; }
+        public void setDmqEligible(boolean v) { this.dmqEligible = v; }
+        public Duration getReplyTtl() { return replyTtl; }
+        public void setReplyTtl(Duration v) { this.replyTtl = v; }
+
+        /** Reply TTL in millis, resolving "unset" against the request timeout. */
+        public long resolveReplyTtlMillis(Duration requestTimeout) {
+            Duration d = replyTtl != null ? replyTtl : requestTimeout;
+            return d == null || d.isNegative() ? 0L : d.toMillis();
+        }
     }
 
     public static class Provision {
@@ -260,6 +302,45 @@ public class SolaceRequestReplyProperties {
      * bootstrap belongs in an init container or Terraform so the running application never
      * holds them and can run with {@code VALIDATE} alone.
      */
+    /**
+     * The dead message queue: where the broker puts a message it has given up on, instead of
+     * deleting it.
+     *
+     * <p>A message lands here when it exhausts {@code replier.provision.max-redelivery} or its
+     * TTL expires. Both halves have to be in place — the message marked eligible and the queue
+     * existing — or the broker deletes it. <b>If the DMQ does not exist the message is deleted
+     * even when it is eligible</b>, which is why this provisions it.
+     *
+     * <p>One shared queue rather than a DMQ per endpoint. Temporary reply queues cannot be given
+     * their own {@code deadMsgQueue} — they are not SEMP-configurable objects — while every
+     * queue already points at {@code #DEAD_MSG_QUEUE} by default. So this needs no SEMP access
+     * and behaves identically for temporary and durable reply endpoints. Dead-lettered messages
+     * keep their original topic, so requests and replies remain easy to tell apart on inspection.
+     */
+    public static class Dmq {
+        /** Mark messages eligible and provision the queue. */
+        private boolean enabled = true;
+        /**
+         * The queue every endpoint dead-letters into. {@code #DEAD_MSG_QUEUE} is the Message
+         * VPN default, which every queue points at without further configuration. Naming
+         * anything else additionally requires setting {@code deadMsgQueue} on each source queue
+         * over SEMP, which this library does not do.
+         */
+        private String name = "#DEAD_MSG_QUEUE";
+        /** Create the queue at startup when missing. Turn off if provisioned out of band. */
+        private boolean provision = true;
+        private int quotaMb = 1000;
+
+        public boolean isEnabled() { return enabled; }
+        public void setEnabled(boolean v) { this.enabled = v; }
+        public String getName() { return name; }
+        public void setName(String v) { this.name = v; }
+        public boolean isProvision() { return provision; }
+        public void setProvision(boolean v) { this.provision = v; }
+        public int getQuotaMb() { return quotaMb; }
+        public void setQuotaMb(int v) { this.quotaMb = v; }
+    }
+
     public static class Semp {
         private String url;
         private String username;

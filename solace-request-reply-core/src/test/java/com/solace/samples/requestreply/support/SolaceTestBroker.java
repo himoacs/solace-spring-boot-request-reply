@@ -145,6 +145,52 @@ public final class SolaceTestBroker {
         return m.find() ? Integer.parseInt(m.group(1)) : 0;
     }
 
+    /**
+     * How many messages are sitting on a queue, read from the message list rather than a
+     * counter. Spooled-message counters on a Solace queue are cumulative and lag; the message
+     * listing is what actually answers "is it in there right now".
+     */
+    public static int queueDepth(String queueName) {
+        HttpResponse<String> res = semp("GET", "/SEMP/v2/monitor/msgVpns/" + VPN + "/queues/"
+                + java.net.URLEncoder.encode(queueName, StandardCharsets.UTF_8)
+                + "/msgs?count=100", null);
+        if (res.statusCode() / 100 != 2) { return 0; }
+        java.util.regex.Matcher m = java.util.regex.Pattern
+                .compile("\"msgId\"").matcher(res.body());
+        int n = 0;
+        while (m.find()) { n++; }
+        return n;
+    }
+
+    /** True when the DMQ holds a message that was published DMQ-eligible. */
+    public static boolean queueHasDmqEligibleMsg(String queueName) {
+        HttpResponse<String> res = semp("GET", "/SEMP/v2/monitor/msgVpns/" + VPN + "/queues/"
+                + java.net.URLEncoder.encode(queueName, StandardCharsets.UTF_8)
+                + "/msgs?count=100", null);
+        return res.statusCode() / 100 == 2 && res.body().contains("\"dmqEligibleAsPublished\":true");
+    }
+
+    /**
+     * A queue with a topic subscription and deliberately no consumer, for testing what happens
+     * to a message nobody ever takes. {@code respectTtlEnabled} matters: SEMP defaults it to
+     * false, and without it messages never expire and the test would wait forever.
+     */
+    public static void createUnconsumedQueue(String queueName, String topic) {
+        semp("POST", "/SEMP/v2/config/msgVpns/" + VPN + "/queues",
+                ("{\"queueName\":\"%s\",\"accessType\":\"non-exclusive\",\"permission\":\"consume\","
+                        + "\"ingressEnabled\":true,\"egressEnabled\":true,\"respectTtlEnabled\":true,"
+                        + "\"maxRedeliveryCount\":1}").formatted(queueName));
+        semp("POST", "/SEMP/v2/config/msgVpns/" + VPN + "/queues/"
+                        + java.net.URLEncoder.encode(queueName, StandardCharsets.UTF_8)
+                        + "/subscriptions",
+                "{\"subscriptionTopic\":\"%s\"}".formatted(topic));
+    }
+
+    public static void deleteQueue(String queueName) {
+        semp("DELETE", "/SEMP/v2/config/msgVpns/" + VPN + "/queues/"
+                + java.net.URLEncoder.encode(queueName, StandardCharsets.UTF_8), null);
+    }
+
     public static HttpResponse<String> semp(String method, String path, String body) {
         try {
             HttpRequest.Builder b = HttpRequest.newBuilder(URI.create(sempUrl() + path))

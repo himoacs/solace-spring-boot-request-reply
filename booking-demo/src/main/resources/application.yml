@@ -42,6 +42,10 @@ solace:
       ttl-matches-timeout: true
       partition-key-expression: "partitionKey()"
       sequence-numbers: true
+      # Needed on brokers before 10.25.10, which move only eligible messages to the DMQ. From
+      # 10.25.10 the broker moves everything, so setting it is what makes behaviour identical
+      # on both.
+      dmq-eligible: true
 
     reply:
       # TEMPORARY needs no provisioning and leaves nothing behind, which is why it is the
@@ -72,6 +76,11 @@ solace:
       queue: q.cris.booking.seatReserve
       topics:
         - "cris/booking/seatReserve/request/v1/>"
+      dmq-eligible: true
+      # Unset means "follow request.timeout", which is what you want: a reply is worthless once
+      # the requestor's future has given up, and a fixed value here would expire replies while
+      # requestors were still waiting as soon as anyone raised the timeout. 0s disables expiry.
+      # reply-ttl: 5s
       access-type: NON_EXCLUSIVE
       concurrency: 4
       provision:
@@ -97,6 +106,17 @@ solace:
           username: ${SEMP_USER:}
           password: ${SEMP_PASS:}
           msg-vpn: ${SOLACE_VPN:default}
+
+    dmq:
+      # On by default. Without a dead message queue the broker DELETES a request that expires or
+      # exhausts its redeliveries -- a booking lost with no trace of it anywhere.
+      enabled: true
+      # The Message VPN default, which every queue already points at, so no SEMP is needed and
+      # temporary reply queues are covered too. Dead-lettered messages keep their original topic,
+      # so requests and replies stay distinguishable in here.
+      name: "#DEAD_MSG_QUEUE"
+      provision: true
+      quota-mb: 1000
 
     tracing:
       # Off by default, and inert even when true unless the OpenTelemetry libraries are present.

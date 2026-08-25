@@ -172,6 +172,9 @@ public class DefaultReplyingSolaceTemplate implements ReplyingSolaceTemplate, Au
         try {
             RequestReplyMessage probe = new RequestReplyMessage(new byte[0]);
             probe.setCorrelationId(id);
+            // Deliberately left DMQ-ineligible. The probe carries a TTL, so marking it eligible
+            // would deposit a canary in the dead message queue on every reconnect and bury the
+            // real failures this feature exists to surface.
             publisher.publish(topic, probe, null, props.getReply().getCanaryTimeout().toMillis());
             waiter.get(props.getReply().getCanaryTimeout().toMillis(),
                     java.util.concurrent.TimeUnit.MILLISECONDS);
@@ -282,6 +285,7 @@ public class DefaultReplyingSolaceTemplate implements ReplyingSolaceTemplate, Au
         });
 
         long ttl = props.getRequest().isTtlMatchesTimeout() ? timeout.toMillis() : 0L;
+        request.setDmqEligible(props.getDmq().isEnabled() && props.getRequest().isDmqEligible());
         try {
             publisher.publish(topic, request, ticket, ttl);
         } catch (TransportException e) {
