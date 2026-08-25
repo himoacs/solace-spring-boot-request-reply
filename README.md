@@ -51,10 +51,7 @@ splitting the two sides across processes, and the latency harness — see
 
 ## How it works
 
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/architecture-dark.svg">
-  <img alt="Request path through a shared non-exclusive queue to competing repliers, and reply path back through a per-instance reply queue" src="docs/architecture-light.svg">
-</picture>
+![Requestors publish to one shared request queue that competing repliers consume from; each requestor has its own durable reply queue subscribed to a topic carrying its instance id, so replies return to the instance that is waiting](docs/architecture.png)
 
 Requests go to a single shared queue that many repliers consume from. Any replier can handle any
 booking, so the broker load-balances across them.

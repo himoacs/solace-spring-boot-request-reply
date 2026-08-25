@@ -26,6 +26,18 @@ For the library's design and configuration reference, see the [root README](../R
 | [10–11](#step-10-split-the-two-sides-into-separate-processes) | Splitting requestor and replier, then scaling repliers out |
 | [12](#step-12-measure-latency) | Exact latency percentiles with a segment breakdown |
 
+
+## How the pieces fit together
+
+![Requestors publish to one shared request queue that competing repliers consume from; each requestor has its own durable reply queue subscribed to a topic carrying its instance id, so replies return to the instance that is waiting](../docs/architecture.png)
+
+Requests go to **one** shared queue that every replier competes on, so any replier can handle any
+booking. Replies cannot be load-balanced that way — the future waiting for one lives in a single
+JVM's heap — so each requestor owns a durable queue subscribed to a topic ending in its own
+instance id. The three requestors shown are the same shape you get from scaling
+(steps [10](#step-10-split-the-two-sides-into-separate-processes) and
+[11](#step-11-scale-the-repliers-out)).
+
 ---
 
 ## Prerequisites
