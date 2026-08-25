@@ -273,6 +273,50 @@ verified over SEMP, using the management credentials under
 than something the application changes on its own, because Solace requires the queue to be drained
 first and reducing the count deletes the messages held in the removed partitions.
 
+### Dead message queues
+
+**This library does not currently wire up a DMQ.** What it sets on the request queue is the
+redelivery and expiry policy around one:
+
+| Property | Default | Maps to |
+|---|---|---|
+| `replier.provision.max-redelivery` | `3` | `maxMsgRedelivery` — attempts before the broker gives up on a message |
+| `replier.provision.respects-ttl` | `true` | `respectsMsgTTL` — whether the queue honours a message's TTL |
+| `replier.provision.discard-notify-sender` | `true` | `discardBehavior` — nack the publisher when the queue discards |
+
+A Solace broker moves a message to a dead message queue when it exceeds `maxMsgRedelivery` or its TTL
+expires — but only if **both** of these hold, and neither does here:
+
+1. **The message is marked DMQ-eligible by the publisher.** JCSMP defaults `setDMQEligible` to
+   `false`, and this library never sets it.
+2. **The DMQ exists.** The queue's `deadMsgQueue` attribute already points at `#DEAD_MSG_QUEUE` by
+   default, but nothing creates that queue. JCSMP's `EndpointProperties` has no DMQ member at any
+   version, so — exactly as with `partitionCount` — it has to come from SEMP or out-of-band
+   provisioning.
+
+The consequence is worth stating plainly: today, a request that exhausts its three redeliveries, or
+whose TTL expires, is **silently discarded**. For a booking system that is a lost request with no
+forensic trail.
+
+Before turning it on, note how it interacts with `request.ttl-matches-timeout`. That setting gives
+every request a TTL equal to the reply timeout, and TTL expiry is a DMQ path just as redelivery
+exhaustion is. Marking every request DMQ-eligible would therefore fill the DMQ with ordinary
+timeouts — requests the requestor has already given up on and reported — mixed in with the genuine
+poison messages you actually want to inspect. The two failures deserve different treatment, so this
+is a design decision rather than a flag to flip.
+
+If you want a DMQ in the meantime, provision it out of band and mark your requests eligible:
+
+```bash
+curl -u admin:admin -X POST http://localhost:8085/SEMP/v2/config/msgVpns/default/queues \
+  -H 'Content-Type: application/json' \
+  -d '{"queueName":"#DEAD_MSG_QUEUE","accessType":"non-exclusive",
+       "permission":"consume","ingressEnabled":true,"egressEnabled":true}'
+```
+
+Eligibility is per message and has no property yet, so it needs a line in the publisher
+(`XMLMessage.setDMQEligible(true)`).
+
 ---
 
 ## Distributed tracing
@@ -361,12 +405,12 @@ you replace them with a custom `Executor`, context propagation will stop working
 
 | Concept | Kafka behaviour | Solace behaviour |
 |---|---|---|
-| Ordering | guaranteed within a partition | a flat non-exclusive queue gives no ordering. `concurrency` adds parallelism, not ordering. The equivalent of a partition key is a partitioned queue. |
+| Ordering | guaranteed within a partition | the queue itself preserves order. Order is lost only when several consumer flows bind to one queue and process in parallel — which is exactly what `concurrency` above 1 does. Keep it with one queue per consumer (queues are cheap in Solace, so fanning a topic subscription out to several is a normal pattern), or use a partitioned queue when you want sticky key-based balancing instead. |
 | Provisioning | you provision topics | the reverse. Topics are just strings and need no setup, while queues are objects with permissions. |
 | Replay | messages are retained by time or size, and you can seek | a queue drains as messages are acknowledged. Reprocessing needs the separate Message Replay feature. |
 | Rebalancing | partitions are reassigned in a stop-the-world rebalance | messages are distributed one at a time across bound flows. Adding an instance takes effect immediately. |
 | Filtering | topic names are flat, so consumers filter in the application | topics are hierarchical and the broker filters per message. |
-| Dead letters | a client-side recoverer republishes to a `.DLT` topic | the broker moves messages to a dead message queue after the redelivery limit. |
+| Dead letters | a client-side recoverer republishes to a `.DLT` topic | the broker moves messages to a dead message queue, with no client code involved — but only for messages the publisher marked DMQ-eligible, and only if the DMQ exists. **This library does neither**, so exhausted and expired messages are discarded. See [Dead message queues](#dead-message-queues). |
 | Queue browsing | not applicable | not available on a partitioned queue. |
 
 ---
