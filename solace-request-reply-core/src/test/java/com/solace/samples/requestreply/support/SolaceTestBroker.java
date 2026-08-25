@@ -176,6 +176,13 @@ public final class SolaceTestBroker {
                 "{\"subscriptionTopic\":\"%s\"}".formatted(topic));
     }
 
+    /** Whether a queue exists on the broker at all. */
+    public static boolean queueExists(String queueName) {
+        HttpResponse<String> res = semp("GET", "/SEMP/v2/config/msgVpns/" + VPN + "/queues/"
+                + java.net.URLEncoder.encode(queueName, StandardCharsets.UTF_8), null);
+        return res.statusCode() / 100 == 2;
+    }
+
     public static void deleteQueue(String queueName) {
         semp("DELETE", "/SEMP/v2/config/msgVpns/" + VPN + "/queues/"
                 + java.net.URLEncoder.encode(queueName, StandardCharsets.UTF_8), null);

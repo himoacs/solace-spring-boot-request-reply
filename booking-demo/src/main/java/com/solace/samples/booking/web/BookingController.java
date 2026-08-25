@@ -10,6 +10,7 @@ import com.solace.samples.requestreply.exception.TransportException;
 import jakarta.validation.Valid;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
@@ -40,12 +41,18 @@ public class BookingController {
 
     private static final Logger log = LoggerFactory.getLogger(BookingController.class);
 
-    private final ReplyingSolaceTemplate template;
+    /**
+     * An ObjectProvider, not the template itself, because a replier-only process has no
+     * requestor side at all: {@code reply.enabled=false} removes the template bean. The
+     * endpoint stays mapped so that calling it on the wrong pod explains itself rather than
+     * returning a bare 404.
+     */
+    private final ObjectProvider<ReplyingSolaceTemplate> templateProvider;
     private final String requestTopicPattern;
 
-    public BookingController(ReplyingSolaceTemplate template,
+    public BookingController(ObjectProvider<ReplyingSolaceTemplate> templateProvider,
                              @Value("${booking.topics.request-pattern}") String requestTopicPattern) {
-        this.template = template;
+        this.templateProvider = templateProvider;
         this.requestTopicPattern = requestTopicPattern;
     }
 
@@ -69,6 +76,16 @@ public class BookingController {
     }
 
     private ResponseEntity<Map<String, Object>> execute(BookingRequest request, String correlationId) {
+        ReplyingSolaceTemplate template = templateProvider.getIfAvailable();
+        if (template == null) {
+            Map<String, Object> body = new LinkedHashMap<>();
+            body.put("error", "not-a-requestor");
+            body.put("detail", "This process runs replier-only "
+                    + "(solace.request-reply.reply.enabled=false), so it has no reply queue and "
+                    + "cannot send a request. Send bookings to a requestor instance instead.");
+            return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE).body(body);
+        }
+
         String topic = requestTopicPattern
                 .replace("{zone}", request.zone())
                 .replace("{trainNo}", request.trainNo());

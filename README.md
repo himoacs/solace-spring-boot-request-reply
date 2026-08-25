@@ -223,6 +223,7 @@ message queue are all created if they do not exist.
 
 | Setting | Default | Why it matters |
 |---|---|---|
+| `reply.enabled` | `true` | Set `false` on a replier-only process. A replier is never addressed on a reply queue, so leaving it on provisions a durable queue that is subscribed, bound and never used — and under a Kubernetes Deployment, strands one per pod on every rollout. |
 | `reply.instance-id` | hostname | Must be unique per instance and stable across restarts. The reply queue is durable and exclusive, so two instances sharing an id bind the same queue and the second silently receives nothing. |
 | `request.ttl-matches-timeout` | `true` | Stops a replier acting on a request after the requestor has given up. Turning it off can produce work nobody is waiting for. |
 | `replier.provision.max-redelivery` | `3` | Zero means redeliver forever, so one malformed message loops indefinitely. |
@@ -254,6 +255,11 @@ Reply endpoint identity: instanceId=pod-0 queue=q.cris.booking.reply.pod-0
 
 The queue is provisioned and subscribed before any flow binds, so a reply published in the gap
 between startup and binding is spooled rather than lost.
+
+**A replier-only process should not have one at all.** It consumes the shared request queue and
+publishes each reply to the requestor's own `replyTo` topic, so nothing is ever addressed to a
+reply queue of its own. Set `reply.enabled: false` there; it removes the reply endpoint, the
+requestor-side template and the reply-path health indicator, and the process says so at startup.
 
 ### Provisioning modes
 
@@ -470,7 +476,7 @@ The report always states which mode produced it.
 ./mvnw test        # starts a broker with Testcontainers
 ```
 
-Twelve integration tests run against a real broker. The behaviour that matters here belongs to the
+Fifteen integration tests run against a real broker. The behaviour that matters here belongs to the
 interaction with the broker, so a test that mocked it would not catch the problems these are written
 to catch.
 
@@ -479,6 +485,7 @@ to catch.
 | `RequestReplyIntegrationTest` | a round trip; the send future resolving independently of the reply; one request producing exactly one unit of work despite three competing flows; a replayed correlation id not repeating the work; 60 concurrent requests correlated correctly; a timed-out request being evicted |
 | `ReplyPathReconnectIntegrationTest` | replies still arrive after the connection is cut from outside using SEMP, with no re-establish logic in play — which is what a durable, broker-side subscription buys. |
 | `ProvisionDriftIntegrationTest` | re-provisioning with identical properties is a no-op; differing properties raise `PropertyMismatchException`; the ignore flag only suppresses "already exists" |
+| `ReplierOnlyIntegrationTest` | with `reply.enabled=false` the context starts, has no reply endpoint or template, still binds the request queue, and provisions no reply queue on the broker |
 | `MinimalConfigIntegrationTest` | the minimal configuration shown in this README actually round-trips, so the example cannot rot |
 | `DmqIntegrationTest` | the DMQ is provisioned at startup; an expired request is kept there rather than deleted, carrying the published eligibility flag; reply TTL derives from `request.timeout` unless set |
 

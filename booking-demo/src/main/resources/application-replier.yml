@@ -1,0 +1,13 @@
+# Replier-only overrides, active under --spring.profiles.active=replier.
+#
+# A replier consumes the shared request queue and publishes each reply to the requestor's own
+# replyTo topic. It is never itself addressed on a reply queue, so provisioning one would create a
+# durable, exclusive queue that is subscribed, bound, and then receives nothing.
+#
+# It matters most on Kubernetes: repliers are interchangeable and belong in a Deployment, whose pod
+# names change on every rollout. With a reply endpoint each rollout would strand the previous pods'
+# queues on the broker, one per pod, for ever.
+solace:
+  request-reply:
+    reply:
+      enabled: false

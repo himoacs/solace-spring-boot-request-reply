@@ -56,6 +56,25 @@ public class SolaceRequestReplyAutoConfiguration {
 
     private static final Logger log = LoggerFactory.getLogger(SolaceRequestReplyAutoConfiguration.class);
 
+    private final SolaceRequestReplyProperties properties;
+
+    public SolaceRequestReplyAutoConfiguration(SolaceRequestReplyProperties properties) {
+        this.properties = properties;
+    }
+
+    /**
+     * An absent bean is the wrong way to learn that a deliberate configuration choice took
+     * effect, so the replier-only mode announces itself.
+     */
+    @jakarta.annotation.PostConstruct
+    void announceReplyMode() {
+        if (!properties.getReply().isEnabled()) {
+            log.info("Reply endpoint disabled (solace.request-reply.reply.enabled=false): this "
+                    + "process provisions no reply queue and cannot send requests. Replies to "
+                    + "requests it handles still go to each request's own replyTo topic.");
+        }
+    }
+
     @Bean(destroyMethod = "close")
     @ConditionalOnMissingBean
     public SolaceSession solaceSession(SpringJCSMPFactory factory) {
@@ -90,8 +109,15 @@ public class SolaceRequestReplyAutoConfiguration {
         return new InMemoryCorrelationStore();
     }
 
+    /**
+     * The reply endpoint, and everything downstream of it, exist only for a process that sends
+     * requests. A replier consumes the shared request queue and publishes to each request's
+     * replyTo topic; nothing is ever addressed to a reply queue of its own.
+     */
     @Bean
     @ConditionalOnMissingBean
+    @ConditionalOnProperty(prefix = "solace.request-reply.reply", name = "enabled",
+            havingValue = "true", matchIfMissing = true)
     public ReplyEndpoint replyEndpoint(SolaceSession session, SolaceRequestReplyProperties props) {
         return new ReplyEndpointFactory(session, props).create();
     }
@@ -102,6 +128,8 @@ public class SolaceRequestReplyAutoConfiguration {
      */
     @Bean(name = "solaceCompletionExecutor", destroyMethod = "shutdown")
     @ConditionalOnMissingBean(name = "solaceCompletionExecutor")
+    @ConditionalOnProperty(prefix = "solace.request-reply.reply", name = "enabled",
+            havingValue = "true", matchIfMissing = true)
     public ExecutorService solaceCompletionExecutor() {
         return Executors.newFixedThreadPool(4, named("rr-complete-"));
     }
@@ -115,6 +143,8 @@ public class SolaceRequestReplyAutoConfiguration {
 
     @Bean(destroyMethod = "close")
     @ConditionalOnMissingBean
+    @ConditionalOnProperty(prefix = "solace.request-reply.reply", name = "enabled",
+            havingValue = "true", matchIfMissing = true)
     public ReplyingSolaceTemplate replyingSolaceTemplate(
             SolaceSession session, ReplyEndpoint replyEndpoint, PersistentPublisher publisher,
             CorrelationStore store, SolaceRequestReplyProperties props, PayloadCodec codec,
@@ -133,6 +163,8 @@ public class SolaceRequestReplyAutoConfiguration {
     @Bean
     @ConditionalOnMissingBean(name = "solaceReplyPathHealthIndicator")
     @ConditionalOnClass(name = "org.springframework.boot.actuate.health.HealthIndicator")
+    @ConditionalOnProperty(prefix = "solace.request-reply.reply", name = "enabled",
+            havingValue = "true", matchIfMissing = true)
     public ReplyPathHealthIndicator solaceReplyPathHealthIndicator(
             SolaceSession session, ReplyEndpoint replyEndpoint) {
         return new ReplyPathHealthIndicator(session, replyEndpoint);

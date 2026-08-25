@@ -1,0 +1,41 @@
+# The repliers: a Deployment, because they are interchangeable. They compete for messages on one
+# shared non-exclusive queue, which is the consumer group, so scaling is just `kubectl scale` --
+# no rebalance, no partition reassignment, and a new pod takes work the moment its flow binds.
+#
+# The replier profile sets solace.request-reply.reply.enabled=false, so these pods provision no
+# reply queue of their own -- which is what makes a Deployment safe here. Their pod names change on
+# every rollout, and a per-pod durable queue would be stranded on the broker each time.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: booking-replier
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app: booking-replier }
+  template:
+    metadata:
+      labels: { app: booking-replier }
+    spec:
+      terminationGracePeriodSeconds: 20
+      containers:
+        - name: app
+          image: booking-demo:local
+          imagePullPolicy: Never
+          args: ["--spring.profiles.active=replier"]
+          envFrom:
+            - configMapRef: { name: solace-connection }
+          env:
+            - name: POD_NAME
+              valueFrom: { fieldRef: { fieldPath: metadata.name } }
+            - name: SOLACE_CLIENT_NAME
+              value: "$(POD_NAME)"
+          ports:
+            - { name: http, containerPort: 8091 }
+          readinessProbe:
+            httpGet: { path: /actuator/health, port: http }
+            initialDelaySeconds: 10
+            periodSeconds: 5
+          resources:
+            requests: { cpu: "250m", memory: "512Mi" }
+            limits:   { cpu: "1",    memory: "768Mi" }

@@ -77,6 +77,25 @@ public class SolaceRequestReplyProperties {
 
     public static class Reply {
         /**
+         * Whether this process needs a reply endpoint at all. True for anything that sends
+         * requests; <b>false for a replier-only process</b>.
+         *
+         * <p>A replier consumes the shared request queue and publishes to each request's
+         * {@code replyTo} topic. Nothing is ever addressed to a reply queue of its own, so
+         * leaving this on provisions a durable, exclusive queue that is subscribed, bound, and
+         * then receives nothing for its entire life.
+         *
+         * <p>That is not merely waste. The queue is named after the instance, so under a
+         * Kubernetes Deployment — where pod names are regenerated on every rollout — each
+         * rollout strands the previous pods' queues on the broker, one per pod, indefinitely.
+         *
+         * <p>Turning it off removes the reply endpoint, the requestor-side template and the
+         * reply-path health indicator. Anything that injects {@code ReplyingSolaceTemplate}
+         * must tolerate its absence.
+         */
+        private boolean enabled = true;
+
+        /**
          * Reply topic pattern. {@code {placeholders}} are substituted per request; those
          * named in {@link #perRequestPlaceholders} become {@code *} in the subscription and
          * are filled at publish time.
@@ -121,6 +140,8 @@ public class SolaceRequestReplyProperties {
 
         private int quotaMb = 100;
 
+        public boolean isEnabled() { return enabled; }
+        public void setEnabled(boolean v) { this.enabled = v; }
         public String getTopicPattern() { return topicPattern; }
         public void setTopicPattern(String v) { this.topicPattern = v; }
         public List<String> getPerRequestPlaceholders() { return perRequestPlaceholders; }

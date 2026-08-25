@@ -27,21 +27,23 @@ import java.util.Map;
 public class DiagnosticsController {
 
     private final SolaceSession session;
-    private final ReplyEndpoint replyEndpoint;
-    private final ReplyingSolaceTemplate template;
+    /** Absent on a replier-only process, where reply.enabled=false removes both beans. */
+    private final ObjectProvider<ReplyEndpoint> replyEndpointProvider;
+    private final ObjectProvider<ReplyingSolaceTemplate> templateProvider;
     private final SolaceRequestReplyProperties props;
     private final CorrelationStore store;
     private final ObjectProvider<SeatInventoryService> inventory;
     private final DmqProvisioner dmq;
 
-    public DiagnosticsController(SolaceSession session, ReplyEndpoint replyEndpoint,
-                                 ReplyingSolaceTemplate template,
+    public DiagnosticsController(SolaceSession session,
+                                 ObjectProvider<ReplyEndpoint> replyEndpointProvider,
+                                 ObjectProvider<ReplyingSolaceTemplate> templateProvider,
                                  SolaceRequestReplyProperties props, CorrelationStore store,
                                  ObjectProvider<SeatInventoryService> inventory,
                                  DmqProvisioner dmq) {
         this.session = session;
-        this.replyEndpoint = replyEndpoint;
-        this.template = template;
+        this.replyEndpointProvider = replyEndpointProvider;
+        this.templateProvider = templateProvider;
         this.props = props;
         this.store = store;
         this.inventory = inventory;
@@ -58,12 +60,20 @@ public class DiagnosticsController {
         sess.put("reconnects", session.reconnectCount());
         out.put("session", sess);
 
+        ReplyEndpoint replyEndpoint = replyEndpointProvider.getIfAvailable();
+        ReplyingSolaceTemplate template = templateProvider.getIfAvailable();
         Map<String, Object> reply = new LinkedHashMap<>();
-        reply.put("established", replyEndpoint.isEstablished());
-        reply.put("queue", replyEndpoint.isEstablished() ? replyEndpoint.queue().getName() : null);
-        reply.put("subscription", replyEndpoint.subscription());
-        reply.put("replyToTemplate", template.replyTopic());
-        reply.put("perRequestPlaceholders", props.getReply().getPerRequestPlaceholders());
+        reply.put("enabled", props.getReply().isEnabled());
+        if (replyEndpoint == null) {
+            // Not a failure: a replier is never addressed on a reply queue, so it provisions none.
+            reply.put("detail", "replier-only; no reply queue is provisioned");
+        } else {
+            reply.put("established", replyEndpoint.isEstablished());
+            reply.put("queue", replyEndpoint.isEstablished() ? replyEndpoint.queue().getName() : null);
+            reply.put("subscription", replyEndpoint.subscription());
+            reply.put("replyToTemplate", template == null ? null : template.replyTopic());
+            reply.put("perRequestPlaceholders", props.getReply().getPerRequestPlaceholders());
+        }
         out.put("replyEndpoint", reply);
 
         SolaceRequestReplyProperties.Replier r = props.getReplier();
@@ -107,8 +117,15 @@ public class DiagnosticsController {
      */
     @GetMapping("/reply-path")
     public Map<String, Object> replyPath() {
-        boolean ready = template.waitForReplyEndpoint(java.time.Duration.ofSeconds(2));
+        ReplyEndpoint replyEndpoint = replyEndpointProvider.getIfAvailable();
+        ReplyingSolaceTemplate template = templateProvider.getIfAvailable();
         Map<String, Object> out = new LinkedHashMap<>();
+        if (replyEndpoint == null || template == null) {
+            out.put("enabled", false);
+            out.put("verdict", "replier-only; this process has no reply path and needs none");
+            return out;
+        }
+        boolean ready = template.waitForReplyEndpoint(java.time.Duration.ofSeconds(2));
         out.put("established", replyEndpoint.isEstablished());
         out.put("ready", ready);
         out.put("queue", replyEndpoint.isEstablished() ? replyEndpoint.queue().getName() : null);

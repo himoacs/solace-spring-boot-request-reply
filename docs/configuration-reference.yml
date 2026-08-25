@@ -89,6 +89,23 @@ solace:
     # -------------------------------------------------- this instance's replies
     reply:
 
+      # Whether this process needs a reply endpoint at all. True for anything
+      # that sends requests; FALSE FOR A REPLIER-ONLY PROCESS.
+      #
+      # A replier consumes the shared request queue and publishes each reply to
+      # the requestor's own replyTo topic. It is never addressed on a reply
+      # queue, so leaving this on provisions a durable, exclusive queue that is
+      # subscribed, bound, and then receives nothing for its whole life.
+      #
+      # It is not only waste. The queue is named after the instance, so under a
+      # Kubernetes Deployment -- where pod names change on every rollout -- each
+      # rollout strands the previous pods' queues on the broker, one per pod,
+      # indefinitely.
+      #
+      # Turning it off removes the reply endpoint, the requestor-side template
+      # and the reply-path health indicator, and the process logs that it has.
+      enabled: true
+
       # Reply queues are durable and exclusive. The subscription is a broker-side
       # object that survives a reconnect on its own, and the queue keeps spooling
       # replies while this instance is disconnected rather than discarding them.

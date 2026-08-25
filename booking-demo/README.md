@@ -469,18 +469,23 @@ queues, so splitting them needs no code change — only profiles.
 > The `--solace.java.client-name=` flags below are purely so each process is easy to spot on the
 > broker.
 >
-> The **reply instance id** is not. It defaults to the hostname, so every process on this machine
-> resolves the *same* id and would bind the *same* durable, exclusive reply queue — the second as a
-> standby that receives nothing, leaving every one of its requests to time out with no error logged
-> anywhere. `--solace.request-reply.reply.instance-id=` is therefore required, not decorative.
+> The **reply instance id** is not, but only requestors have one. It defaults to the hostname, so
+> two requestors on this machine would resolve the *same* id and bind the *same* durable, exclusive
+> reply queue — the second as a standby that receives nothing, leaving every one of its requests to
+> time out with no error logged anywhere. Repliers are exempt because they provision no reply queue,
+> which is why only the requestor below passes `--solace.request-reply.reply.instance-id=`.
+
+The replier profile also sets `reply.enabled=false` (see
+[application-replier.yml](src/main/resources/application-replier.yml)), so a replier provisions **no
+reply queue of its own** — it is never addressed on one. It says so at startup, and `POST
+/api/bookings` on a replier answers `503 not-a-requestor` rather than pretending it can help.
 
 ```bash
 JAR=booking-demo/target/booking-demo-0.1.0-SNAPSHOT.jar
 
-# Replier only: the listener runs, no bookings are sent from here.
+# Replier only: the listener runs, no bookings are sent from here, and no reply queue is made.
 java -jar $JAR --spring.profiles.active=replier --server.port=8092 \
-  --solace.java.client-name=replier-1 \
-  --solace.request-reply.reply.instance-id=replier-1 &
+  --solace.java.client-name=replier-1 &
 
 # Requestor only: the listener is disabled, so this process cannot answer its own requests.
 java -jar $JAR --spring.profiles.active=requestor --server.port=8091 \
@@ -524,8 +529,7 @@ Add a second replier against the same queue:
 
 ```bash
 java -jar $JAR --spring.profiles.active=replier --server.port=8093 \
-  --solace.java.client-name=replier-2 \
-  --solace.request-reply.reply.instance-id=replier-2 &
+  --solace.java.client-name=replier-2 &
 
 for i in $(seq 1 12); do
   curl -s -o /dev/null -X POST http://localhost:8091/api/bookings \
