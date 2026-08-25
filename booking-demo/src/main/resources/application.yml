@@ -18,8 +18,11 @@ solace:
     client-username: ${SOLACE_USER:default}
     client-password: ${SOLACE_PASS:default}
     # A readable client name is what makes this app identifiable in the broker's client list
-    # during a support call.
-    client-name: ${HOSTNAME:booking-demo}
+    # during a support call. The random suffix is what keeps it unique: a Message VPN permits one
+    # client per name, so two instances sharing one evict each other and reconnect in a loop.
+    # HOSTNAME is the pod name on Kubernetes, and is typically unset on a developer machine --
+    # which is precisely where several instances do share a host.
+    client-name: ${SOLACE_CLIENT_NAME:${HOSTNAME:booking-demo}-${random.int[1000,9999]}}
     connect-retries: 1
     connect-retries-per-host: 5
     # 100 x 3000ms = 300s, the documented HA target. The commonly copied 20 gives only 60s.
