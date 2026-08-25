@@ -4,7 +4,6 @@ import com.solace.samples.booking.replier.SeatInventoryService;
 import com.solace.samples.requestreply.api.ReplyingSolaceTemplate;
 import com.solace.samples.requestreply.config.SolaceRequestReplyProperties;
 import com.solace.samples.requestreply.core.CorrelationStore;
-import com.solace.samples.requestreply.core.TracingContextBridge;
 import com.solace.samples.requestreply.endpoint.DmqProvisioner;
 import com.solace.samples.requestreply.endpoint.ReplyEndpoint;
 import com.solace.samples.requestreply.transport.SolaceSession;
@@ -33,14 +32,12 @@ public class DiagnosticsController {
     private final SolaceRequestReplyProperties props;
     private final CorrelationStore store;
     private final ObjectProvider<SeatInventoryService> inventory;
-    private final TracingContextBridge tracing;
     private final DmqProvisioner dmq;
 
     public DiagnosticsController(SolaceSession session, ReplyEndpoint replyEndpoint,
                                  ReplyingSolaceTemplate template,
                                  SolaceRequestReplyProperties props, CorrelationStore store,
                                  ObjectProvider<SeatInventoryService> inventory,
-                                 TracingContextBridge tracing,
                                  DmqProvisioner dmq) {
         this.session = session;
         this.replyEndpoint = replyEndpoint;
@@ -48,7 +45,6 @@ public class DiagnosticsController {
         this.props = props;
         this.store = store;
         this.inventory = inventory;
-        this.tracing = tracing;
         this.dmq = dmq;
     }
 
@@ -63,13 +59,11 @@ public class DiagnosticsController {
         out.put("session", sess);
 
         Map<String, Object> reply = new LinkedHashMap<>();
-        reply.put("type", props.getReply().getEndpointType());
         reply.put("established", replyEndpoint.isEstablished());
         reply.put("queue", replyEndpoint.isEstablished() ? replyEndpoint.queue().getName() : null);
         reply.put("subscription", replyEndpoint.subscription());
         reply.put("replyToTemplate", template.replyTopic());
         reply.put("perRequestPlaceholders", props.getReply().getPerRequestPlaceholders());
-        reply.put("recreateOnReconnect", props.getReply().isRecreateOnReconnect());
         out.put("replyEndpoint", reply);
 
         SolaceRequestReplyProperties.Replier r = props.getReplier();
@@ -81,8 +75,6 @@ public class DiagnosticsController {
         req.put("provisionMode", r.getProvision().getMode());
         req.put("maxRedelivery", r.getProvision().getMaxRedelivery());
         req.put("respectsTtl", r.getProvision().isRespectsTtl());
-        req.put("partitionCount", r.getPartitioning().getPartitionCount());
-        req.put("partitioned", r.getPartitioning().getPartitionCount() > 0);
         out.put("requestQueue", req);
 
         Map<String, Object> flight = new LinkedHashMap<>();
@@ -93,8 +85,8 @@ public class DiagnosticsController {
 
         Map<String, Object> d = new LinkedHashMap<>();
         d.put("configuredEnabled", props.getDmq().isEnabled());
-        // Separate from the flag for the same reason tracing is: dead-lettering can be switched
-        // on and still be inert, because a DMQ that does not exist means the broker deletes.
+        // Separate from the flag because dead-lettering can be switched on and still be inert:
+        // a DMQ that does not exist means the broker deletes instead of moving.
         d.put("established", dmq.isEstablished());
         d.put("queue", dmq.queueName());
         d.put("detail", dmq.detail());
@@ -104,25 +96,14 @@ public class DiagnosticsController {
                 props.getReplier().resolveReplyTtlMillis(props.getRequest().getTimeout()));
         out.put("dmq", d);
 
-        Map<String, Object> tr = new LinkedHashMap<>();
-        tr.put("configuredEnabled", props.getTracing().isEnabled());
-        // Distinct from the flag: tracing can be switched on and still be inert if the
-        // OpenTelemetry libraries are absent, so report what is actually in effect.
-        tr.put("active", tracing.isActive());
-        tr.put("propagateContext", props.getTracing().isPropagateContext());
-        tr.put("bridge", tracing.getClass().getSimpleName());
-        out.put("tracing", tr);
-
         return out;
     }
 
     /**
-     * Round-trips a probe through this instance's own reply path.
+     * Whether this instance's reply path is up.
      *
-     * <p>Exists because of one specific failure: a temporary reply queue destroyed past its
-     * linger window is recreated by the broker <em>without</em> its subscription. The session is
-     * up, the flow is bound, nothing logs an error, and every request times out for ever. This
-     * turns that state into an answer.
+     * <p>Worth its own endpoint because an instance that cannot receive replies still accepts
+     * requests perfectly happily, and answers every one of them with a timeout.
      */
     @GetMapping("/reply-path")
     public Map<String, Object> replyPath() {
@@ -133,7 +114,7 @@ public class DiagnosticsController {
         out.put("queue", replyEndpoint.isEstablished() ? replyEndpoint.queue().getName() : null);
         out.put("subscription", replyEndpoint.subscription());
         out.put("verdict", ready ? "reply path is bound and subscribed"
-                : "reply path is NOT ready — replies would be lost");
+                : "reply path is NOT ready — every request would time out");
         return out;
     }
 }

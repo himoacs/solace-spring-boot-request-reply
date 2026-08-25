@@ -4,7 +4,6 @@ import com.solace.samples.requestreply.api.RequestReplyMessage;
 import com.solace.samples.requestreply.api.SolaceHeaders;
 import com.solace.samples.requestreply.api.SolaceListenerErrorHandler;
 import com.solace.samples.requestreply.core.PayloadCodec;
-import com.solace.samples.requestreply.core.TracingContextBridge;
 import com.solace.samples.requestreply.endpoint.RequestQueueProvisioner;
 import com.solace.samples.requestreply.transport.FlowConsumer;
 import com.solace.samples.requestreply.transport.InboundMessage;
@@ -50,7 +49,6 @@ public class SolaceMessageListenerContainer implements AutoCloseable {
     private final HandlerMethodInvoker invoker;
     private final SolaceListenerErrorHandler errorHandler;
     private final ExecutorService handlerExecutor;
-    private final TracingContextBridge tracing;
     private final boolean replyDmqEligible;
     /** Resolved once at construction, not per message: "unset" already means request.timeout. */
     private final long replyTtlMillis;
@@ -67,7 +65,6 @@ public class SolaceMessageListenerContainer implements AutoCloseable {
                                           HandlerMethodInvoker invoker,
                                           SolaceListenerErrorHandler errorHandler,
                                           ExecutorService handlerExecutor,
-                                          TracingContextBridge tracing,
                                           boolean replyDmqEligible,
                                           long replyTtlMillis) {
         this.endpoint = endpoint;
@@ -78,7 +75,6 @@ public class SolaceMessageListenerContainer implements AutoCloseable {
         this.invoker = invoker;
         this.errorHandler = errorHandler;
         this.handlerExecutor = handlerExecutor;
-        this.tracing = tracing;
         this.replyDmqEligible = replyDmqEligible;
         this.replyTtlMillis = replyTtlMillis;
     }
@@ -115,13 +111,7 @@ public class SolaceMessageListenerContainer implements AutoCloseable {
      * on this instance, and a nested request from it could never complete.
      */
     private void onRequest(BytesXMLMessage raw) {
-        // Prefer the context carried in the message: it makes the handler a child of the span
-        // that issued the request, in the other process. Falling back to the dispatch thread's
-        // context would produce a valid trace rooted in the wrong place.
-        Object ctx = tracing.extract(raw);
-        if (ctx == null) { ctx = tracing.captureCurrent(); }
-        Object finalCtx = ctx;
-        handlerExecutor.execute(tracing.wrap(finalCtx, () -> handle(raw)));
+        handlerExecutor.execute(() -> handle(raw));
     }
 
     private void handle(BytesXMLMessage raw) {

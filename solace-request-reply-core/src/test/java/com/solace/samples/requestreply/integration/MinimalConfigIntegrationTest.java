@@ -54,7 +54,7 @@ class MinimalConfigIntegrationTest {
         assertThat(template.waitForReplyEndpoint(Duration.ofSeconds(20))).isTrue();
 
         Map<?, ?> reply = template.sendAndReceive(
-                        "my/service/request/v1/thing", null, Map.of("value", "minimal"),
+                        "my/service/request/v1/thing", Map.of("value", "minimal"),
                         Map.class, Duration.ofSeconds(10))
                 .get(15, TimeUnit.SECONDS);
 

@@ -127,7 +127,7 @@ public class LoadTestRunner implements ApplicationRunner {
                     .replace("{zone}", req.zone())
                     .replace("{trainNo}", req.trainNo());
             try {
-                template.sendAndReceive(topic, req.partitionKey(), req, SeatReservation.class,
+                template.sendAndReceive(topic, req, SeatReservation.class,
                                 template.defaultReplyTimeout())
                         .whenComplete((res, err) -> {
                             if (intervalNanos == 0) { slots.release(); }

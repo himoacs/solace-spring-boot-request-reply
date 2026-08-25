@@ -18,16 +18,14 @@ public final class RequestReplyMessage {
     private String correlationId;
     private String replyTo;
     private String contentType = "application/json";
-    private String partitionKey;
     private Long sequence;
 
     private boolean error;
     private String errorMessage;
     /**
      * Whether the broker may move this message to the dead message queue rather than deleting
-     * it once it exhausts redelivery or expires. Off by default, matching JCSMP: the request
-     * and reply paths opt in from configuration, while the reply-path canary deliberately does
-     * not, since it carries a TTL and would otherwise dead-letter a probe on every reconnect.
+     * it once it exhausts redelivery or expires. Off by default, matching JCSMP; the request and
+     * reply paths opt in from configuration.
      */
     private boolean dmqEligible;
 
@@ -63,9 +61,6 @@ public final class RequestReplyMessage {
 
     public RequestReplyMessage setContentType(String v) { this.contentType = v; return this; }
 
-    public String getPartitionKey() { return partitionKey; }
-
-    public RequestReplyMessage setPartitionKey(String v) { this.partitionKey = v; return this; }
 
     public Long getSequence() { return sequence; }
 
@@ -110,7 +105,6 @@ public final class RequestReplyMessage {
     public String toString() {
         return "RequestReplyMessage{correlationId=" + correlationId
                 + ", replyTo=" + replyTo
-                + ", partitionKey=" + partitionKey
                 + ", error=" + error
                 + ", bytes=" + (payload == null ? 0 : payload.length) + '}';
     }

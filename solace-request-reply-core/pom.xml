@@ -41,22 +41,6 @@
       <optional>true</optional>
     </dependency>
 
-    <!-- Tracing is opt-in: optional here, so a customer who disables it carries neither the
-         dependency nor the cost. The Solace integration is looked up reflectively, so its
-         absence degrades to in-process context restoration rather than failing. -->
-    <dependency>
-      <groupId>io.opentelemetry</groupId>
-      <artifactId>opentelemetry-api</artifactId>
-      <version>${opentelemetry.version}</version>
-      <optional>true</optional>
-    </dependency>
-    <dependency>
-      <groupId>com.solace</groupId>
-      <artifactId>solace-opentelemetry-jcsmp-integration</artifactId>
-      <version>${otel-jcsmp.version}</version>
-      <optional>true</optional>
-    </dependency>
-
     <dependency>
       <groupId>org.springframework.boot</groupId>
       <artifactId>spring-boot-starter-test</artifactId>
@@ -75,12 +59,6 @@
     <dependency>
       <groupId>org.awaitility</groupId>
       <artifactId>awaitility</artifactId>
-      <scope>test</scope>
-    </dependency>
-    <dependency>
-      <groupId>io.opentelemetry</groupId>
-      <artifactId>opentelemetry-sdk</artifactId>
-      <version>${opentelemetry.version}</version>
       <scope>test</scope>
     </dependency>
   </dependencies>

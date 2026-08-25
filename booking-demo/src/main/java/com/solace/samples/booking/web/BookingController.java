@@ -75,7 +75,7 @@ public class BookingController {
 
         long start = System.nanoTime();
         RequestReplyFuture<SeatReservation> future = template.sendAndReceive(
-                topic, request.partitionKey(), request, SeatReservation.class,
+                topic, request, SeatReservation.class,
                 template.defaultReplyTimeout(), correlationId);
 
         // Stage one: did the broker accept and spool the request?
@@ -105,7 +105,7 @@ public class BookingController {
                     "totalMicros", total / 1_000,
                     "publishConfirmMicros", confirmNanos / 1_000));
             body.put("requestTopic", topic);
-            body.put("partitionKey", request.partitionKey());
+            body.put("inventoryRow", request.inventoryRow());
             body.put("replyTopic", template.replyTopic());
             return ResponseEntity.ok(body);
 

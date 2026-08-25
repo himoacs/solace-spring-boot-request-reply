@@ -88,7 +88,7 @@ class DmqIntegrationTest {
         int before = SolaceTestBroker.queueDepth(DMQ);
 
         // Nothing consumes this queue, so the request sits on it until its TTL expires.
-        template.sendAndReceive(UNHANDLED_TOPIC + "/x", null, Map.of("value", "expires"),
+        template.sendAndReceive(UNHANDLED_TOPIC + "/x", Map.of("value", "expires"),
                 Map.class, Duration.ofSeconds(2));
 
         await().atMost(Duration.ofSeconds(45)).pollInterval(Duration.ofSeconds(1))
@@ -122,14 +122,4 @@ class DmqIntegrationTest {
                 .isZero();
     }
 
-    @Test
-    void theCanaryIsNeverDeadLettered() {
-        // The probe carries a TTL, so marking it eligible would deposit a canary in the DMQ on
-        // every reconnect and bury the real failures this feature exists to surface.
-        int before = SolaceTestBroker.queueDepth(DMQ);
-        for (int i = 0; i < 3; i++) {
-            assertThat(template.waitForReplyEndpoint(Duration.ofSeconds(10))).isTrue();
-        }
-        assertThat(SolaceTestBroker.queueDepth(DMQ)).isEqualTo(before);
-    }
 }

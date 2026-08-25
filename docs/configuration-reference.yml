@@ -73,15 +73,6 @@ solace:
       # booking system that produces a reservation the customer never sees.
       ttl-matches-timeout: true
 
-      # SpEL evaluated against the request payload to produce the partition key.
-      # An explicit argument to sendAndReceive overrides it.
-      #
-      # Choose the granularity of the contended resource, not the request. Too
-      # coarse and you get hot partitions; too fine, such as a request id, and it
-      # hashes randomly, which gives you flat-queue behaviour while looking
-      # correct. The key is ignored by a flat queue, so it is safe to set now and
-      # enable partitioning later without touching the application.
-      partition-key-expression: "partitionKey()"
 
       # Stamps a monotonic sequence number on each request, which lets the load
       # test detect message loss and out-of-order arrival.
@@ -98,22 +89,9 @@ solace:
     # -------------------------------------------------- this instance's replies
     reply:
 
-      # Both are production-viable; this is a trade, not a ladder.
-      #
-      # TEMPORARY needs no provisioning and leaves nothing behind, which makes a
-      # first run simple and keeps maintenance at zero: no endpoint to declare,
-      # none to clean up. Its subscription is client-side state, so it must be
-      # reapplied if the broker destroys the queue past its linger window --
-      # which recreate-on-reconnect does and canary-on-reconnect verifies.
-      #
-      # DURABLE keeps the subscription as a broker-side object that survives on
-      # its own, and the queue keeps spooling replies while the requestor is
-      # disconnected instead of discarding them. In exchange it wants a stable
-      # instance id and a plan for draining orphaned queues.
-      #
-      # Choose on whether replies must survive a requestor outage, and whether
-      # your operational model prefers endpoints declared up front.
-      endpoint-type: TEMPORARY           # TEMPORARY | DURABLE
+      # Reply queues are durable and exclusive. The subscription is a broker-side
+      # object that survives a reconnect on its own, and the queue keeps spooling
+      # replies while this instance is disconnected rather than discarding them.
 
       # The reply topic. {placeholders} are substituted; see the two lists below.
       topic-pattern: "requestreply/reply/v1/{instanceId}"
@@ -136,31 +114,26 @@ solace:
       placeholders: {}
       #  zone: nr
 
-      # Identity of this instance. Blank resolves to the hostname plus a short
-      # random suffix. The suffix matters: it stops a restarted process from
-      # picking up replies addressed to its previous incarnation, whose futures
-      # died with it.
+      # Identity of this instance, substituted into the topic and queue name above.
+      # Blank resolves to the hostname, which is the pod name on Kubernetes.
+      #
+      # It must be unique per instance and stable across restarts. The reply queue
+      # is durable and exclusive, so two instances resolving the same id bind the
+      # same queue: the second becomes a standby that receives nothing, and every
+      # one of its requests times out with no error logged anywhere. An id that
+      # instead CHANGES between runs strands the previous queue on the broker,
+      # still spooling replies nobody will read.
+      #
+      # Set it explicitly to run more than one instance on a single host.
       instance-id: ""
 
       queue-name-pattern: "q.requestreply.reply.{instanceId}"
 
-      # After a reconnect, re-create the endpoint, re-apply the subscription and
-      # re-bind the flow. Leave this on. A temporary queue that outlives its
-      # linger window is recreated by the broker without its subscription, and in
-      # that state nothing is logged while every request times out.
-      recreate-on-reconnect: true
-
-      # Publish a probe to our own reply topic and require it back, at startup
-      # and after every reconnect. This is what turns the failure above into
-      # something observable: it is the only check that requires a message to
-      # complete the round trip. Reported by the reply-path health indicator.
-      canary-on-reconnect: true
-      canary-timeout: 10s
 
       # How long waitForReplyEndpoint() blocks during startup.
       wait-for-endpoint: 10s
 
-      # Spool quota for a DURABLE reply queue, in MB. Ignored for TEMPORARY.
+      # Spool quota for the reply queue, in MB.
       quota-mb: 100
 
     # -------------------------------------------------------------- the replier
@@ -222,46 +195,6 @@ solace:
         # its request was dropped instead of only timing out.
         discard-notify-sender: true
 
-      partitioning:
-        # 0 is a flat queue. A flat queue needs no SEMP access and keeps
-        # selectors, queue browsing and replay, but gives no ordering: two
-        # concurrent requests for the same resource are handled in parallel.
-        #
-        # Above 0 expects a partitioned queue, which serialises requests sharing
-        # a partition key. JCSMP cannot express a partition count at any version,
-        # so this is applied over SEMP.
-        #
-        # Sizing, per Solace guidance: the maximum number of consumers you expect
-        # to bind. Concurrency 10 across 3 instances is 30 flows, so use 32.
-        partition-count: 0
-
-        # Seconds the broker waits for consumer count to settle before
-        # rebalancing, and how long consumers get to acknowledge outstanding
-        # messages during a handoff.
-        rebalance-delay: 5s
-        rebalance-max-handoff-time: 3s
-
-        # This library's own guard, not a Solace setting -- the broker's queue
-        # object exposes only partitionCount, partitionRebalanceDelay and
-        # partitionRebalanceMaxHandoffTime. What it controls is what this
-        # library does when the live partitionCount differs from the configured
-        # one: fail startup, or PATCH the queue over SEMP.
-        #
-        # Off by default, and deliberately so: Solace requires the queue to be
-        # drained first, and reducing the count deletes the messages held in the
-        # removed partitions. Leaving this off turns a mismatch into a startup
-        # failure rather than silent data loss during a redeploy.
-        allow-partition-resize: false
-
-        # Only consulted when partition-count is above 0. These are management
-        # credentials, which are more privileged than the messaging ones above.
-        # In production, do this bootstrap from an init container or Terraform so
-        # the running application never holds them and can use VALIDATE instead.
-        semp:
-          url: ""                        # e.g. http://localhost:8085
-          username: ""
-          password: ""
-          msg-vpn: default
 
     # ------------------------------------------------------ dead message queue
     dmq:
@@ -277,11 +210,10 @@ solace:
 
       # One shared queue rather than a DMQ per endpoint. #DEAD_MSG_QUEUE is the
       # Message VPN default that every queue already points at, so this needs no
-      # SEMP access at all. Naming anything else would additionally require
-      # setting deadMsgQueue on each source queue over SEMP, and temporary reply
-      # queues cannot carry that setting -- they are not SEMP-configurable
-      # objects. Dead-lettered messages keep their original topic, so requests
-      # and replies remain easy to tell apart on inspection.
+      # management access at all. Naming anything else would additionally require
+      # setting deadMsgQueue on each source queue over SEMP. Dead-lettered
+      # messages keep their original topic, so requests and replies remain easy
+      # to tell apart on inspection.
       name: "#DEAD_MSG_QUEUE"
 
       # Create it at startup when missing. Turn off if it is provisioned out of
@@ -294,18 +226,6 @@ solace:
       # them straight back out of the one place they are meant to survive.
       quota-mb: 1000
 
-    # --------------------------------------------------------------- tracing
-    tracing:
-      # Off by default. Activating it also requires the OpenTelemetry API on the
-      # classpath and no TracingContextBridge bean of your own. If any of those
-      # is missing, the library uses a no-op bridge that captures nothing.
-      enabled: false
-
-      # Carry W3C trace context in messages so a trace spans processes. Needs
-      # com.solace:solace-opentelemetry-jcsmp-integration. Without that library
-      # the in-process behaviour still works and a warning explains what is
-      # missing.
-      propagate-context: true
 
 # ---------------------------------------------------------------------------
 # Demo-only settings. These belong to booking-demo, not to the library.

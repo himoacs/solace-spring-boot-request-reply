@@ -135,16 +135,6 @@ public final class SolaceTestBroker {
         return null;
     }
 
-    /** A queue's partition count, or null when the queue does not exist. */
-    public static Integer partitionCount(String queueName) {
-        HttpResponse<String> res = semp("GET", "/SEMP/v2/config/msgVpns/" + VPN + "/queues/"
-                + java.net.URLEncoder.encode(queueName, StandardCharsets.UTF_8), null);
-        if (res.statusCode() == 404) { return null; }
-        java.util.regex.Matcher m = java.util.regex.Pattern
-                .compile("\"partitionCount\"\\s*:\\s*(\\d+)").matcher(res.body());
-        return m.find() ? Integer.parseInt(m.group(1)) : 0;
-    }
-
     /**
      * How many messages are sitting on a queue, read from the message list rather than a
      * counter. Spooled-message counters on a Solace queue are cumulative and lag; the message

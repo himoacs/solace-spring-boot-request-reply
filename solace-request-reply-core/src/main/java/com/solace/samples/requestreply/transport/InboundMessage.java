@@ -27,7 +27,6 @@ public final class InboundMessage {
             try {
                 switch (key) {
                     case SolaceHeaders.CONTENT_TYPE -> model.setContentType(sdt.getString(key));
-                    case SolaceHeaders.PARTITION_KEY -> model.setPartitionKey(sdt.getString(key));
                     case SolaceHeaders.SEQUENCE -> model.setSequence(sdt.getLong(key));
                     case SolaceHeaders.ERROR -> {
                         if (Boolean.TRUE.equals(sdt.getBoolean(key))) { model.asError("remote error"); }

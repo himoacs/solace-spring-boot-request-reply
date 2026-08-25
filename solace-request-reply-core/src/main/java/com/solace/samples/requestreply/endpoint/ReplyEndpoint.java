@@ -2,6 +2,8 @@ package com.solace.samples.requestreply.endpoint;
 
 import com.solacesystems.jcsmp.Queue;
 
+import java.util.Map;
+
 /**
  * This instance's private reply endpoint.
  *
@@ -13,35 +15,19 @@ import com.solacesystems.jcsmp.Queue;
 public interface ReplyEndpoint extends AutoCloseable {
 
     /**
-     * Creates or provisions the queue.
+     * Provisions the queue and maps the reply topic onto it.
      *
-     * <p>Does <em>not</em> subscribe: a temporary queue does not exist on the broker until a flow
-     * binds to it, so the subscription has to wait. Call {@link #applySubscription()} after binding.
+     * <p>Both in one step, and before any flow binds. A durable queue exists on the broker as
+     * soon as it is provisioned, so it can carry a subscription immediately — and doing both
+     * up front leaves no window in which the endpoint exists but matches nothing, so a reply
+     * published before the flow binds is still spooled rather than lost.
      */
     void establish();
-
-    /**
-     * Maps the reply topic onto the queue. Must be called <b>after</b> a flow has bound, because
-     * JCSMP rejects a subscription on a queue the broker does not yet hold — "Unknown Queue",
-     * subcode 20 — and rejects passing one at bind time, since {@code setNewSubscription} applies
-     * to topic endpoints rather than queues.
-     */
-    void applySubscription();
-
-    /**
-     * Re-establishes after a reconnect.
-     *
-     * <p>Mandatory for a temporary queue, which is destroyed once its linger window expires
-     * and recreated <em>without</em> its subscription — a state in which the session is up,
-     * the flow is bound, nothing logs an error, and every request times out for ever.
-     * Harmless for a durable queue, whose subscription is a broker-side object.
-     */
-    void reestablish();
 
     Queue queue();
 
     /** Concrete topic this instance publishes as reply-to, per-request placeholders resolved. */
-    String replyTopic(java.util.Map<String, String> perRequestValues);
+    String replyTopic(Map<String, String> perRequestValues);
 
     /** Subscription form, with per-request placeholders replaced by {@code *}. */
     String subscription();

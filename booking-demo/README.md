@@ -24,8 +24,7 @@ For the library's design and configuration reference, see the [root README](../R
 | [8](#step-8-the-double-booking-guard) | The double-booking guard under at-least-once delivery |
 | [9](#step-9-nothing-is-lost-when-a-request-expires) | Dead-lettering: an expired request kept for inspection instead of deleted |
 | [10–11](#step-10-split-the-two-sides-into-separate-processes) | Splitting requestor and replier, then scaling repliers out |
-| [12](#step-12-the-reply-path-health-check) | The reply-path health check that catches a silent failure mode |
-| [13](#step-13-measure-latency) | Exact latency percentiles with a segment breakdown |
+| [12](#step-12-measure-latency) | Exact latency percentiles with a segment breakdown |
 
 ---
 
@@ -70,35 +69,36 @@ The startup log is the most useful thing in this walkthrough, because it narrate
 library does before a single message is sent:
 
 ```
-SolaceSession        : Solace session connected: host=tcp://localhost:55565 vpn=default
-PersistentPublisher  : Publisher started, deliveryMode=PERSISTENT
-AbstractReplyEndpoint: Reply endpoint prepared: kind=TEMPORARY
-                       queue=#P2P/QTMP/v:rrdemo/q.cris.booking.reply.<host>-4c31ba46
-                       subscription=cris/booking/seatReserve/reply/v1/nr/*/<host>-4c31ba46
-FlowConsumer         : Flow 'reply' bound to queue '#P2P/QTMP/...' (ackMode=AUTO)
-DefaultReplyingSolaceTemplate : Reply path verified: a probe published to
-                       'cris/booking/seatReserve/reply/v1/nr/unknown/<host>-4c31ba46' came back
+SolaceSession         : Solace session connected: host=tcp://localhost:55565 vpn=default
+ReplyEndpointFactory  : Reply endpoint identity: instanceId=<host> queue=q.cris.booking.reply.<host>
+PersistentPublisher   : Publisher started, deliveryMode=PERSISTENT
+DurableReplyEndpoint  : Reply endpoint ready: queue=q.cris.booking.reply.<host>
+                        subscription=cris/booking/seatReserve/reply/v1/nr/*/<host>
+FlowConsumer          : Flow 'reply' bound to queue 'q.cris.booking.reply.<host>' (ackMode=AUTO)
+DmqProvisioner        : Dead message queue '#DEAD_MSG_QUEUE' provisioned/verified: quota=1000MB
+                        respectsTtl=false
 RequestQueueProvisioner : Request queue 'q.cris.booking.seatReserve' provisioned/verified:
-                       accessType=NON_EXCLUSIVE quota=2000MB maxRedelivery=3 respectsTtl=true
+                        accessType=NON_EXCLUSIVE quota=2000MB maxRedelivery=3 respectsTtl=true
 RequestQueueProvisioner : Mapped topic 'cris/booking/seatReserve/request/v1/>' onto queue
-FlowConsumer         : Flow 'seatReserve-0' bound to queue 'q.cris...' (ackMode=CLIENT)
-FlowConsumer         : Flow 'seatReserve-1' ...  (four flows: concurrency=4)
+FlowConsumer          : Flow 'seatReserve-0' bound to queue 'q.cris...' (ackMode=CLIENT)
+FlowConsumer          : Flow 'seatReserve-1' ...  (four flows: concurrency=4)
 SolaceMessageListenerContainer : Listener 'seatReserve' started: queue=q.cris.booking.seatReserve
-                       concurrency=4 topics=[cris/booking/seatReserve/request/v1/>]
-Started BookingDemoApplication in 2.145 seconds
+                        concurrency=4 topics=[cris/booking/seatReserve/request/v1/>]
+Started BookingDemoApplication in 1.706 seconds
 ```
 
 Five things happened there, in order:
 
 1. **The session connected.** Settings come from `solace.java.*`, the namespace the official
    `solace-java-spring-boot-starter` already binds. This library adds nothing there.
-2. **A reply endpoint was created.** `TEMPORARY` by default, so nothing needs provisioning ahead of
-   time and nothing is left behind. Its subscription wildcards the train-number level.
-3. **The reply path was verified by a round-trip probe** — an actual message published to this
-   instance's own reply topic that had to come back. This is `canary-on-reconnect`, and it is the
-   only check that proves a message can complete the circuit.
-4. **The request queue was provisioned** and the topic subscription mapped onto it.
-5. **Four consumer flows bound** to that queue, from `concurrency: 4`.
+2. **This instance named itself.** `instanceId` defaults to the hostname and decides the reply
+   queue's name, so it is logged rather than left implicit — see step 10 for why that matters.
+3. **The durable reply queue was provisioned and subscribed**, both before the flow binds, so a
+   reply arriving in that gap is spooled rather than lost. Its subscription wildcards the
+   train-number level.
+4. **The dead message queue and the request queue were provisioned**, and the request topic
+   subscription mapped onto the latter.
+5. **Four consumer flows bound** to the request queue, from `concurrency: 4`.
 
 Both sides of the conversation run in this one process, which is what lets a single `curl`
 demonstrate a full round trip. Step 9 splits them.
@@ -122,8 +122,8 @@ curl -s -X POST http://localhost:8091/api/bookings \
   },
   "latency": { "totalMicros": 60194, "publishConfirmMicros": 13104 },
   "requestTopic": "cris/booking/seatReserve/request/v1/nr/12951",
-  "partitionKey": "12951-2026-09-15-3a",
-  "replyTopic": "cris/booking/seatReserve/reply/v1/nr/unknown/<host>-4c31ba46"
+  "inventoryRow": "12951-2026-09-15-3a",
+  "replyTopic": "cris/booking/seatReserve/reply/v1/nr/unknown/<host>"
 }
 ```
 
@@ -136,9 +136,9 @@ Three fields are worth reading:
 
 - **`publishConfirmMicros`** is how long the broker took to acknowledge the request as *spooled*.
   It is measured separately from the round trip because it answers a different question. See step 6.
-- **`partitionKey`** is `train-date-class` — the contended inventory row. Not the request id.
-  Too coarse creates hot partitions; too fine hashes randomly and silently reintroduces the race
-  that partitioning exists to remove.
+- **`inventoryRow`** is `train-date-class` — the seats two simultaneous bookings actually compete
+  for, and the key the replier locks on. Not the request id, of which there is one per caller and
+  which would therefore protect nothing.
 - **`replyTopic`** shows `unknown` in the train-number position because this is the *template*.
   The concrete per-request value is in step 4.
 
@@ -150,14 +150,14 @@ Look at the application log for the request you just sent:
 
 ```
 SeatReservationListener : A Sharma train=12951 class=3a -> PNR 0841866636 CONFIRMED |
-    replyTo=cris/booking/seatReserve/reply/v1/nr/12951/<host>-4c31ba46
+    replyTo=cris/booking/seatReserve/reply/v1/nr/12951/<host>
 ```
 
 Compare the two topics:
 
 ```
-subscription   cris/booking/seatReserve/reply/v1/nr/*/<host>-4c31ba46
-reply-to       cris/booking/seatReserve/reply/v1/nr/12951/<host>-4c31ba46
+subscription   cris/booking/seatReserve/reply/v1/nr/*/<host>
+reply-to       cris/booking/seatReserve/reply/v1/nr/12951/<host>
 ```
 
 The requestor subscribes **once**, with a wildcard in the train-number position, and builds a
@@ -185,7 +185,7 @@ reply:
 | Placeholder | Resolved | In the subscription | In each reply-to |
 |---|---|---|---|
 | `{zone}` | once at startup, from `placeholders` | `nr` | `nr` |
-| `{instanceId}` | once at startup: hostname plus a random suffix | `<host>-4c31ba46` | `<host>-4c31ba46` |
+| `{instanceId}` | once at startup: hostname plus a random suffix | `<host>` | `<host>` |
 | `{trainNo}` | on every publish, from the expression | `*` | `12951` |
 
 The two `per-request-*` properties do different jobs, which is why you need both:
@@ -228,24 +228,24 @@ curl -s http://localhost:8091/api/diagnostics/endpoints | jq
 {
   "session":  { "connected": true, "lastEvent": "CONNECTED", "reconnects": 0 },
   "replyEndpoint": {
-    "type": "TEMPORARY", "established": true,
-    "subscription": "cris/booking/seatReserve/reply/v1/nr/*/<host>-4c31ba46",
-    "perRequestPlaceholders": ["trainNo"], "recreateOnReconnect": true
+    "established": true,
+    "queue": "q.cris.booking.reply.<host>",
+    "subscription": "cris/booking/seatReserve/reply/v1/nr/*/<host>",
+    "perRequestPlaceholders": ["trainNo"]
   },
   "requestQueue": {
     "queue": "q.cris.booking.seatReserve", "accessType": "NON_EXCLUSIVE",
     "concurrency": 4, "provisionMode": "CREATE_IF_MISSING",
-    "maxRedelivery": 3, "respectsTtl": true,
-    "partitionCount": 0, "partitioned": false
+    "maxRedelivery": 3, "respectsTtl": true
   },
-  "inFlight":  { "pendingRequests": 0, "distinctReservations": 2 },
-  "tracing":   { "configuredEnabled": false, "active": false }
+  "inFlight": { "pendingRequests": 0, "distinctReservations": 2 },
+  "dmq": { "configuredEnabled": true, "established": true, "queue": "#DEAD_MSG_QUEUE" }
 }
 ```
 
-`tracing` reports `configuredEnabled` and `active` separately on purpose: tracing can be switched on
-and still be inert because the OpenTelemetry libraries are not on the classpath. A single boolean
-would hide that.
+`dmq` reports `configuredEnabled` and `established` separately on purpose: dead-lettering can be
+switched on and still be inert, because a DMQ that could not be created means the broker deletes
+instead of moving. A single boolean would hide that.
 
 ---
 
@@ -432,7 +432,6 @@ This is the part worth internalising, because a message you expect to find and c
 | Reply published after the requestor has gone, once `reply-ttl` elapses | yes |
 | `"simulate":"remote-error"` — the handler throws | **no** — it becomes an error reply, and the request is acknowledged |
 | `"simulate":"timeout"` — the handler returns `null` | **no** — it declines to reply but still acknowledges |
-| The reply-path canary from step 12 | **no** — deliberately ineligible, or every reconnect would leave one |
 
 "The requestor timed out" and "the request was dead-lettered" are different events. `simulate=timeout`
 produces the first without the second: a handler that runs to completion and simply says nothing has
@@ -453,9 +452,8 @@ curl -s http://localhost:8091/api/diagnostics/endpoints | jq '.dmq'
 }
 ```
 
-`configuredEnabled` and `established` are separate for the same reason they are under `tracing`:
-dead-lettering can be switched on and still be inert, because a DMQ that could not be created means
-the broker goes back to deleting.
+`configuredEnabled` and `established` are separate because dead-lettering can be switched on and
+still be inert: a DMQ that could not be created means the broker goes back to deleting.
 
 ---
 
@@ -464,24 +462,30 @@ the broker goes back to deleting.
 Nothing about the demo requires both sides in one JVM. They are independent beans over separate
 queues, so splitting them needs no code change — only profiles.
 
-> **On client names.** A Message VPN permits one client per name, so instances that share a name
-> evict each other and reconnect in a loop. [application.yml](src/main/resources/application.yml)
-> therefore gives every process a unique one by default —
-> `${SOLACE_CLIENT_NAME:${HOSTNAME:booking-demo}-${random.int[1000,9999]}}` — so the commands below
-> just work. Override it with `--solace.java.client-name=` or `SOLACE_CLIENT_NAME` when you want a
-> name you chose in the broker's client list; the examples do so purely for readability.
+> **Two things must differ per process, and only one is automatic.**
+>
+> The **client name** is handled for you: a Message VPN permits one client per name, and
+> [application.yml](src/main/resources/application.yml) gives every process a unique one by default.
+> The `--solace.java.client-name=` flags below are purely so each process is easy to spot on the
+> broker.
+>
+> The **reply instance id** is not. It defaults to the hostname, so every process on this machine
+> resolves the *same* id and would bind the *same* durable, exclusive reply queue — the second as a
+> standby that receives nothing, leaving every one of its requests to time out with no error logged
+> anywhere. `--solace.request-reply.reply.instance-id=` is therefore required, not decorative.
 
 ```bash
 JAR=booking-demo/target/booking-demo-0.1.0-SNAPSHOT.jar
 
 # Replier only: the listener runs, no bookings are sent from here.
-# --solace.java.client-name is optional; it just makes this process easy to spot on the broker.
-java -jar $JAR --spring.profiles.active=replier \
-  --server.port=8092 --solace.java.client-name=replier-1 &
+java -jar $JAR --spring.profiles.active=replier --server.port=8092 \
+  --solace.java.client-name=replier-1 \
+  --solace.request-reply.reply.instance-id=replier-1 &
 
 # Requestor only: the listener is disabled, so this process cannot answer its own requests.
-java -jar $JAR --spring.profiles.active=requestor \
-  --server.port=8091 --solace.java.client-name=requestor-1 &
+java -jar $JAR --spring.profiles.active=requestor --server.port=8091 \
+  --solace.java.client-name=requestor-1 \
+  --solace.request-reply.reply.instance-id=requestor-1 &
 ```
 
 Confirm the requestor really has no listener — this prints nothing:
@@ -506,7 +510,7 @@ And in the **replier's** log, on port 8092:
 
 ```
 SeatReservationListener : S Nair train=12621 class=2a -> PNR 0571124365 CONFIRMED |
-    replyTo=cris/booking/seatReserve/reply/v1/nr/12621/<host>-2c86810f
+    replyTo=cris/booking/seatReserve/reply/v1/nr/12621/requestor-1
 ```
 
 Two processes, one round trip. The reply found its way back to the specific requestor JVM whose heap
@@ -519,8 +523,9 @@ holds the waiting future, because the reply topic names that instance.
 Add a second replier against the same queue:
 
 ```bash
-java -jar $JAR --spring.profiles.active=replier \
-  --server.port=8093 --solace.java.client-name=replier-2 &
+java -jar $JAR --spring.profiles.active=replier --server.port=8093 \
+  --solace.java.client-name=replier-2 \
+  --solace.request-reply.reply.instance-id=replier-2 &
 
 for i in $(seq 1 12); do
   curl -s -o /dev/null -X POST http://localhost:8091/api/bookings \
@@ -534,64 +539,12 @@ Count the handled requests in each replier's log. In the captured run, 13 reques
 across the two processes.
 
 They competed for messages on one shared non-exclusive queue — that queue *is* the consumer group, the
-Solace equivalent of a Kafka `groupId`. No rebalance, no partition reassignment, no restart: the new
-instance began taking work the moment its flow bound.
+Solace equivalent of a Kafka `groupId`. No rebalance and no restart: the new instance began taking
+work the moment its flow bound.
 
 ---
 
-## Step 12: The reply-path health check
-
-There is a failure mode worth knowing about. A temporary reply queue survives a disconnect for 60
-seconds, or 180 across a failover. Past that the broker destroys it — and when the client reconnects,
-the broker recreates the queue **without its topic subscription**.
-
-In that state the session is connected, the flow is bound, the queue exists, nothing is logged, and
-every request times out until the process is restarted.
-
-```bash
-curl -s http://localhost:8091/api/diagnostics/reply-path | jq
-```
-
-```json
-{
-  "established": true, "ready": true,
-  "subscription": "cris/booking/seatReserve/reply/v1/nr/*/<host>-4c31ba46",
-  "verdict": "reply path is bound and subscribed"
-}
-```
-
-The same verdict is wired into Spring Boot's health endpoint, so a readiness probe can remove an
-instance that cannot answer:
-
-```bash
-curl -s http://localhost:8091/actuator/health | jq '.components.solaceReplyPath'
-```
-
-```json
-{
-  "status": "UP",
-  "details": {
-    "sessionConnected": true, "reconnects": 0,
-    "replyEndpointEstablished": true, "replyPathVerified": true,
-    "replyPathDetail": "verified by a round-trip probe"
-  }
-}
-```
-
-`recreate-on-reconnect` redoes the sequence after a reconnect, and `canary-on-reconnect` then proves
-it with a real message. Between them the failure is handled and, more importantly, *visible* — which
-is what makes `TEMPORARY` a perfectly sound production choice, and a low-maintenance one: nothing to
-provision, nothing left behind, no queue lifecycle to own.
-
-`DURABLE` is the alternative, not the upgrade. It trades that zero maintenance for a broker-side
-subscription that survives on its own, and for a queue that keeps spooling replies while the
-requestor is disconnected instead of discarding them. Pick it when you want replies to survive a
-requestor outage, or when your operational model prefers endpoints declared up front; stay on
-`TEMPORARY` when you would rather own no endpoint at all.
-
----
-
-## Step 13: Measure latency
+## Step 12: Measure latency
 
 One command runs a test, prints a report, and exits. No metrics backend required.
 
@@ -695,7 +648,7 @@ If you have used Spring Kafka, the shapes are deliberately familiar:
 ```java
 // Requestor
 RequestReplyFuture<SeatReservation> f = template.sendAndReceive(
-        topic, request.partitionKey(), request, SeatReservation.class);
+        topic, request, SeatReservation.class);
 
 // Replier
 @SolaceListener(queue = "q.cris.booking.seatReserve",
@@ -708,9 +661,9 @@ public SeatReservation reserve(@Payload BookingRequest req,
 }
 ```
 
-The `partitionKey` argument plays exactly the role a Kafka record key plays. A flat queue ignores it,
-so it is safe — and recommended — to always supply one: turning on partitioning later then needs no
-application change.
+Requests land on one flat non-exclusive queue and the broker load-balances them across every bound
+flow, which is what makes `concurrency` and extra replier processes add throughput without any
+coordination in the application.
 
 ### Source map
 
@@ -718,7 +671,7 @@ application change.
 src/main/java/com/solace/samples/booking/
   BookingDemoApplication.java     plain @SpringBootApplication; the library auto-configures
   domain/
-    BookingRequest.java           request; partitionKey() is the contended inventory row
+    BookingRequest.java           request; inventoryRow() is the contended inventory row
     SeatReservation.java          reply; `replayed` is the visible redelivery signal
     SeatClass.java                AC1/AC2/AC3/SLEEPER/... with topic-level codes
   web/

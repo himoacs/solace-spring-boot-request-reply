@@ -25,10 +25,10 @@ import java.util.concurrent.atomic.AtomicInteger;
  * database.
  *
  * <h2>Concurrency</h2>
- * On a flat non-exclusive queue there is no ordering, so two requests for the last berth on one
- * train are handled in parallel by different instances. The inventory row is therefore mutated
- * under a lock — {@code compute} on a per-row key. Partitioning the queue removes the
- * contention rather than the need for this: the invariant still belongs here.
+ * A flat non-exclusive queue load-balances across every bound flow, so two requests for the last
+ * berth on one train can be handled at the same moment, by different threads or different
+ * instances. The inventory row is therefore mutated under a lock — {@code compute} on a per-row
+ * key — because the invariant belongs here rather than in how messages happen to be distributed.
  */
 @Service
 public class SeatInventoryService {
@@ -40,7 +40,7 @@ public class SeatInventoryService {
     /** correlationId -> the reply already produced for it. The idempotency guard. */
     private final Map<String, SeatReservation> byCorrelationId = new ConcurrentHashMap<>();
 
-    /** partitionKey -> seats already allotted on that train/date/class. */
+    /** inventory row -> seats already allotted on that train/date/class. */
     private final Map<String, AtomicInteger> allotted = new ConcurrentHashMap<>();
 
     /**
@@ -61,7 +61,7 @@ public class SeatInventoryService {
     }
 
     private SeatReservation reserve(BookingRequest request) {
-        String row = request.partitionKey();
+        String row = request.inventoryRow();
         int seats = request.seatsOrOne();
         AtomicInteger counter = allotted.computeIfAbsent(row, k -> new AtomicInteger());
 
@@ -87,15 +87,15 @@ public class SeatInventoryService {
     }
 
     private static String pnr(BookingRequest r, int firstSeat) {
-        long h = Math.abs((long) (r.partitionKey() + firstSeat).hashCode());
+        long h = Math.abs((long) (r.inventoryRow() + firstSeat).hashCode());
         return String.format("%010d", h % 10_000_000_000L);
     }
 
     /** Distinct reservations made, ignoring redeliveries. Used by tests and diagnostics. */
     public int reservationCount() { return byCorrelationId.size(); }
 
-    public int seatsAllotted(String partitionKey) {
-        AtomicInteger c = allotted.get(partitionKey);
+    public int seatsAllotted(String inventoryRow) {
+        AtomicInteger c = allotted.get(inventoryRow);
         return c == null ? 0 : c.get();
     }
 }

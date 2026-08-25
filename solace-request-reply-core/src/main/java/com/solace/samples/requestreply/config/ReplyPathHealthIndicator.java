@@ -1,6 +1,5 @@
 package com.solace.samples.requestreply.config;
 
-import com.solace.samples.requestreply.core.DefaultReplyingSolaceTemplate;
 import com.solace.samples.requestreply.endpoint.ReplyEndpoint;
 import com.solace.samples.requestreply.transport.SolaceSession;
 import org.springframework.boot.actuate.health.Health;
@@ -9,32 +8,25 @@ import org.springframework.boot.actuate.health.HealthIndicator;
 /**
  * Reports the reply path through Actuator, so an orchestrator can act on it.
  *
- * <p>This exists because the most damaging failure in this design is silent. A temporary reply
- * queue recreated after its linger window has no topic subscription: the session is connected, the
- * flow is bound, the queue exists, nothing is logged, and every request times out until the process
- * restarts. Reporting DOWN lets a readiness probe remove the instance instead of leaving it to
- * accept requests it can never answer.
+ * <p>An instance whose session is down, or whose reply endpoint never came up, cannot answer a
+ * request it accepts. Reporting DOWN lets a readiness probe take it out of rotation rather than
+ * leaving it to collect requests it will only time out.
  */
 public class ReplyPathHealthIndicator implements HealthIndicator {
 
     private final SolaceSession session;
     private final ReplyEndpoint replyEndpoint;
-    private final DefaultReplyingSolaceTemplate template;
 
-    public ReplyPathHealthIndicator(SolaceSession session, ReplyEndpoint replyEndpoint,
-                                    DefaultReplyingSolaceTemplate template) {
+    public ReplyPathHealthIndicator(SolaceSession session, ReplyEndpoint replyEndpoint) {
         this.session = session;
         this.replyEndpoint = replyEndpoint;
-        this.template = template;
     }
 
     @Override
     public Health health() {
         boolean connected = session.isConnected();
         boolean established = replyEndpoint.isEstablished();
-        boolean verified = template.isReplyPathVerified();
-
-        Health.Builder builder = (connected && established && verified) ? Health.up() : Health.down();
+        Health.Builder builder = (connected && established) ? Health.up() : Health.down();
         return builder
                 .withDetail("sessionConnected", connected)
                 .withDetail("lastSessionEvent", session.lastEvent())
@@ -42,8 +34,6 @@ public class ReplyPathHealthIndicator implements HealthIndicator {
                 .withDetail("replyEndpointEstablished", established)
                 .withDetail("replyQueue", established ? replyEndpoint.queue().getName() : null)
                 .withDetail("replySubscription", replyEndpoint.subscription())
-                .withDetail("replyPathVerified", verified)
-                .withDetail("replyPathDetail", template.replyPathDetail())
                 .build();
     }
 }

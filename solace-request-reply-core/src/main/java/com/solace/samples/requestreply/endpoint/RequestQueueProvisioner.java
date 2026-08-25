@@ -37,27 +37,19 @@ public class RequestQueueProvisioner {
 
     private final SolaceSession session;
     private final SolaceRequestReplyProperties.Replier cfg;
-    private final SempClient semp;
 
     public RequestQueueProvisioner(SolaceSession session,
-                                   SolaceRequestReplyProperties.Replier cfg,
-                                   SempClient semp) {
+                                   SolaceRequestReplyProperties.Replier cfg) {
         this.session = session;
         this.cfg = cfg;
-        this.semp = semp;
     }
 
     /** @return the queue, ready to bind flows against. */
     public Queue ensure(String queueName, List<String> topics) {
         Queue queue = JCSMPFactory.onlyInstance().createQueue(queueName);
         ProvisionMode mode = cfg.getProvision().getMode();
-        int partitionCount = cfg.getPartitioning().getPartitionCount();
 
-        if (partitionCount > 0) {
-            // JCSMP cannot express a partition count: EndpointProperties has no partition
-            // member at any version, verified against sol-jcsmp 10.30.1. SEMP owns it.
-            semp.ensurePartitionedQueue(queueName, partitionCount);
-        } else if (mode != ProvisionMode.OFF) {
+        if (mode != ProvisionMode.OFF) {
             provision(queue, queueName, mode);
         } else {
             log.info("Request queue '{}': provision mode OFF, assuming it exists", queueName);

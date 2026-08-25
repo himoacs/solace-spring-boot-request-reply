@@ -68,7 +68,7 @@ class RequestReplyIntegrationTest {
     @Test
     void roundTripsAndConfirmsThePublishSeparately() throws Exception {
         RequestReplyFuture<Map> future = template.sendAndReceive(
-                TOPIC, "12951", Map.of("value", "hello"), Map.class, Duration.ofSeconds(6));
+                TOPIC, Map.of("value", "hello"), Map.class, Duration.ofSeconds(6));
 
         // The send future must resolve on its own, before and independently of the reply: that
         // separation is what distinguishes "never landed" from "nobody answered".
@@ -81,7 +81,7 @@ class RequestReplyIntegrationTest {
 
     @Test
     void oneRequestDoesWorkExactlyOnceDespiteCompetingConsumers() throws Exception {
-        template.sendAndReceive(TOPIC, "12951", Map.of("value", "single"), Map.class,
+        template.sendAndReceive(TOPIC, Map.of("value", "single"), Map.class,
                 Duration.ofSeconds(6)).get(10, TimeUnit.SECONDS);
 
         // Three flows are bound. A direct topic subscription would have delivered to all three,
@@ -98,9 +98,9 @@ class RequestReplyIntegrationTest {
     void replayingACorrelationIdDoesNotRepeatTheWork() throws Exception {
         String correlationId = "replay-" + UUID.randomUUID();
 
-        Map<?, ?> first = template.sendAndReceive(TOPIC, "12951", Map.of("value", "once"),
+        Map<?, ?> first = template.sendAndReceive(TOPIC, Map.of("value", "once"),
                 Map.class, Duration.ofSeconds(6), correlationId).get(10, TimeUnit.SECONDS);
-        Map<?, ?> second = template.sendAndReceive(TOPIC, "12951", Map.of("value", "once"),
+        Map<?, ?> second = template.sendAndReceive(TOPIC, Map.of("value", "once"),
                 Map.class, Duration.ofSeconds(6), correlationId).get(10, TimeUnit.SECONDS);
 
         assertThat(handler.distinctWork())
@@ -116,7 +116,7 @@ class RequestReplyIntegrationTest {
         int n = 60;
         var futures = new java.util.ArrayList<RequestReplyFuture<Map>>();
         for (int i = 0; i < n; i++) {
-            futures.add(template.sendAndReceive(TOPIC, "12951", Map.of("value", "req-" + i),
+            futures.add(template.sendAndReceive(TOPIC, Map.of("value", "req-" + i),
                     Map.class, Duration.ofSeconds(15)));
         }
         for (int i = 0; i < n; i++) {
@@ -133,7 +133,7 @@ class RequestReplyIntegrationTest {
     void anUnansweredRequestTimesOutAndIsEvicted() {
         // Nothing subscribes here, so the request is spooled to no queue and no replier sees it.
         RequestReplyFuture<Map> future = template.sendAndReceive(
-                "test/rr/unrouted/v1/nobody", null, Map.of("value", "x"), Map.class,
+                "test/rr/unrouted/v1/nobody", Map.of("value", "x"), Map.class,
                 Duration.ofMillis(700));
 
         assertThatThrownBy(() -> future.get(10, TimeUnit.SECONDS))

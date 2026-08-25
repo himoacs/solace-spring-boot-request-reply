@@ -16,11 +16,6 @@ public final class SolaceHeaders {
     /** Native SMF reply-to destination. Where the replier sends the reply. */
     public static final String REPLY_TO = "solace_replyTo";
 
-    /**
-     * Partition key for a partitioned queue, carried as the {@code JMSXGroupID} user
-     * property. Harmlessly ignored by a flat queue, which is why it is always published.
-     */
-    public static final String PARTITION_KEY = "JMSXGroupID";
 
     /** Error-forwarding flag set by the replier when a handler threw. */
     public static final String ERROR = "rr_error";

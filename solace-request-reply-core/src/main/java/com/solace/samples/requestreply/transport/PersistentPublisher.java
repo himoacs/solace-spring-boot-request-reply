@@ -2,7 +2,6 @@ package com.solace.samples.requestreply.transport;
 
 import com.solace.samples.requestreply.api.RequestReplyMessage;
 import com.solace.samples.requestreply.api.SolaceHeaders;
-import com.solace.samples.requestreply.core.TracingContextBridge;
 import com.solace.samples.requestreply.exception.TransportException;
 import com.solacesystems.jcsmp.BytesMessage;
 import com.solacesystems.jcsmp.DeliveryMode;
@@ -33,18 +32,13 @@ public class PersistentPublisher implements AutoCloseable {
 
     private final SolaceSession session;
     private final DeliveryMode deliveryMode;
-    private final TracingContextBridge tracing;
     private volatile XMLMessageProducer producer;
 
-    public PersistentPublisher(SolaceSession session, String deliveryMode) {
-        this(session, deliveryMode, TracingContextBridge.NOOP);
-    }
 
-    public PersistentPublisher(SolaceSession session, String deliveryMode, TracingContextBridge tracing) {
+    public PersistentPublisher(SolaceSession session, String deliveryMode) {
         this.session = session;
         this.deliveryMode = "DIRECT".equalsIgnoreCase(deliveryMode)
                 ? DeliveryMode.DIRECT : DeliveryMode.PERSISTENT;
-        this.tracing = tracing == null ? TracingContextBridge.NOOP : tracing;
     }
 
     public synchronized void start() {
@@ -87,11 +81,6 @@ public class PersistentPublisher implements AutoCloseable {
             if (message.getContentType() != null) {
                 sdt.putString(SolaceHeaders.CONTENT_TYPE, message.getContentType());
             }
-            // Always stamped. A flat queue ignores it, so enabling partitioning later is a
-            // queue-side change with no application redeploy.
-            if (message.getPartitionKey() != null) {
-                sdt.putString(SolaceHeaders.PARTITION_KEY, message.getPartitionKey());
-            }
             if (message.getSequence() != null) {
                 sdt.putLong(SolaceHeaders.SEQUENCE, message.getSequence());
             }
@@ -108,9 +97,6 @@ public class PersistentPublisher implements AutoCloseable {
             }
             msg.setProperties(sdt);
 
-            // Injected after the properties are set and immediately before the send, so the
-            // span that is current at publish time is the one carried on the wire.
-            tracing.inject(msg);
 
             Topic dest = JCSMPFactory.onlyInstance().createTopic(topic);
             p.send(msg, dest);

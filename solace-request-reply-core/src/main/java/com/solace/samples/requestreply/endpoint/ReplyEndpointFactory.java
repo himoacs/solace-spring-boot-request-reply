@@ -2,15 +2,18 @@ package com.solace.samples.requestreply.endpoint;
 
 import com.solace.samples.requestreply.config.SolaceRequestReplyProperties;
 import com.solace.samples.requestreply.transport.SolaceSession;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.net.InetAddress;
 import java.net.UnknownHostException;
 import java.util.LinkedHashMap;
 import java.util.Map;
-import java.util.UUID;
 
-/** Builds the configured reply endpoint and resolves this instance's identity. */
+/** Builds this instance's reply endpoint and resolves its identity. */
 public class ReplyEndpointFactory {
+
+    private static final Logger log = LoggerFactory.getLogger(ReplyEndpointFactory.class);
 
     private final SolaceSession session;
     private final SolaceRequestReplyProperties props;
@@ -32,18 +35,23 @@ public class ReplyEndpointFactory {
 
         String queueName = cfg.getQueueNamePattern().replace("{instanceId}", instanceId);
 
-        return switch (cfg.getEndpointType()) {
-            case DURABLE -> new DurableReplyEndpoint(session, pattern, queueName, cfg.getQuotaMb());
-            case TEMPORARY -> new TemporaryReplyEndpoint(session, pattern, queueName);
-        };
+        // Logged because a collision is otherwise silent and expensive: two processes resolving
+        // the same id bind the same exclusive queue, the second receives nothing, and every one
+        // of its requests times out with no error anywhere.
+        log.info("Reply endpoint identity: instanceId={} queue={}", instanceId, queueName);
+
+        return new DurableReplyEndpoint(session, pattern, queueName, cfg.getQuotaMb());
     }
 
     /**
-     * Hostname plus a short random suffix when not configured.
+     * The configured id, or the hostname.
      *
-     * <p>The suffix matters for the temporary case: two processes on one host must not collide,
-     * and a restarted process must not inherit replies addressed to its previous incarnation,
-     * whose futures died with it.
+     * <p>No random suffix: the queue is durable, so a value that changed between runs would
+     * strand the previous queue on the broker, still spooling replies nobody will read. The
+     * hostname is stable across a restart and is the pod name on Kubernetes.
+     *
+     * <p>The corollary is that two instances sharing a host must be told apart explicitly, via
+     * {@code solace.request-reply.reply.instance-id}.
      */
     static String resolveInstanceId(String configured) {
         if (configured != null && !configured.isBlank()) {
@@ -57,6 +65,6 @@ public class ReplyEndpointFactory {
                 host = "unknown-host";
             }
         }
-        return ReplyTopicPattern.sanitize(host) + "-" + UUID.randomUUID().toString().substring(0, 8);
+        return ReplyTopicPattern.sanitize(host);
     }
 }

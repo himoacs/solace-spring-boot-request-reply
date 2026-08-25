@@ -7,12 +7,10 @@ import com.solace.samples.requestreply.core.CorrelationStore;
 import com.solace.samples.requestreply.core.DefaultReplyingSolaceTemplate;
 import com.solace.samples.requestreply.core.InMemoryCorrelationStore;
 import com.solace.samples.requestreply.core.PayloadCodec;
-import com.solace.samples.requestreply.core.TracingContextBridge;
 import com.solace.samples.requestreply.endpoint.ReplyEndpoint;
 import com.solace.samples.requestreply.endpoint.ReplyEndpointFactory;
 import com.solace.samples.requestreply.endpoint.DmqProvisioner;
 import com.solace.samples.requestreply.endpoint.RequestQueueProvisioner;
-import com.solace.samples.requestreply.endpoint.SempClient;
 import com.solace.samples.requestreply.latency.LatencyRecorder;
 import com.solace.samples.requestreply.listener.HandlerMethodInvoker;
 import com.solace.samples.requestreply.listener.SolaceListenerAnnotationBeanPostProcessor;
@@ -72,11 +70,6 @@ public class SolaceRequestReplyAutoConfiguration {
         return new PayloadCodec(mapper.getIfAvailable(ObjectMapper::new));
     }
 
-    @Bean
-    @ConditionalOnMissingBean
-    public TracingContextBridge tracingContextBridge() {
-        return TracingContextBridge.NOOP;
-    }
 
     @Bean
     @ConditionalOnMissingBean
@@ -87,9 +80,8 @@ public class SolaceRequestReplyAutoConfiguration {
     @Bean(destroyMethod = "close")
     @ConditionalOnMissingBean
     public PersistentPublisher persistentPublisher(SolaceSession session,
-                                                   SolaceRequestReplyProperties props,
-                                                   TracingContextBridge tracing) {
-        return new PersistentPublisher(session, props.getRequest().getDeliveryMode(), tracing);
+                                                   SolaceRequestReplyProperties props) {
+        return new PersistentPublisher(session, props.getRequest().getDeliveryMode());
     }
 
     @Bean
@@ -105,11 +97,8 @@ public class SolaceRequestReplyAutoConfiguration {
     }
 
     /**
-     * Completion pool for reply futures.
-     *
-     * <p>A plain JDK pool on purpose. The OpenTelemetry agent propagates context across
-     * executors by an exact class-name allowlist that includes {@code ThreadPoolExecutor} but
-     * not custom implementations, so the ordinary choice is also the one that keeps traces whole.
+     * Completion pool for reply futures, kept off the JCSMP dispatch thread so a slow
+     * continuation registered by a caller cannot stall delivery of every other reply.
      */
     @Bean(name = "solaceCompletionExecutor", destroyMethod = "shutdown")
     @ConditionalOnMissingBean(name = "solaceCompletionExecutor")
@@ -129,11 +118,10 @@ public class SolaceRequestReplyAutoConfiguration {
     public ReplyingSolaceTemplate replyingSolaceTemplate(
             SolaceSession session, ReplyEndpoint replyEndpoint, PersistentPublisher publisher,
             CorrelationStore store, SolaceRequestReplyProperties props, PayloadCodec codec,
-            ExecutorService solaceCompletionExecutor, LatencyRecorder.Collecting latency,
-            TracingContextBridge tracing) {
+            ExecutorService solaceCompletionExecutor, LatencyRecorder.Collecting latency) {
         DefaultReplyingSolaceTemplate template = new DefaultReplyingSolaceTemplate(
                 session, replyEndpoint, publisher, store, props, codec,
-                solaceCompletionExecutor, latency, tracing);
+                solaceCompletionExecutor, latency);
         template.start();
         if (!template.waitForReplyEndpoint(props.getReply().getWaitForEndpoint())) {
             log.warn("Reply endpoint was not ready within {}; early requests may time out",
@@ -146,16 +134,10 @@ public class SolaceRequestReplyAutoConfiguration {
     @ConditionalOnMissingBean(name = "solaceReplyPathHealthIndicator")
     @ConditionalOnClass(name = "org.springframework.boot.actuate.health.HealthIndicator")
     public ReplyPathHealthIndicator solaceReplyPathHealthIndicator(
-            SolaceSession session, ReplyEndpoint replyEndpoint, ReplyingSolaceTemplate template) {
-        return new ReplyPathHealthIndicator(session, replyEndpoint,
-                (DefaultReplyingSolaceTemplate) template);
+            SolaceSession session, ReplyEndpoint replyEndpoint) {
+        return new ReplyPathHealthIndicator(session, replyEndpoint);
     }
 
-    @Bean
-    @ConditionalOnMissingBean
-    public SempClient sempClient(SolaceRequestReplyProperties props) {
-        return new SempClient(props.getReplier().getPartitioning());
-    }
 
     /**
      * Provisioned eagerly at startup rather than lazily on first dead message, because by the
@@ -173,9 +155,8 @@ public class SolaceRequestReplyAutoConfiguration {
     @Bean
     @ConditionalOnMissingBean
     public RequestQueueProvisioner requestQueueProvisioner(SolaceSession session,
-                                                           SolaceRequestReplyProperties props,
-                                                           SempClient semp) {
-        return new RequestQueueProvisioner(session, props.getReplier(), semp);
+                                                           SolaceRequestReplyProperties props) {
+        return new RequestQueueProvisioner(session, props.getReplier());
     }
 
     @Bean
@@ -216,11 +197,11 @@ public class SolaceRequestReplyAutoConfiguration {
             SolaceListenerAnnotationBeanPostProcessor postProcessor,
             SolaceSession session, RequestQueueProvisioner provisioner,
             PersistentPublisher publisher, PayloadCodec codec, HandlerMethodInvoker invoker,
-            ExecutorService solaceHandlerExecutor, TracingContextBridge tracing,
+            ExecutorService solaceHandlerExecutor,
             ObjectProvider<SolaceListenerErrorHandler> errorHandlers,
             SolaceRequestReplyProperties props) {
         return new SolaceListenerRegistrar(postProcessor, session, provisioner, publisher, codec,
-                invoker, solaceHandlerExecutor, tracing, errorHandlers, props);
+                invoker, solaceHandlerExecutor, errorHandlers, props);
     }
 
     private static ThreadFactory named(String prefix) {
@@ -243,7 +224,6 @@ public class SolaceRequestReplyAutoConfiguration {
         private final PayloadCodec codec;
         private final HandlerMethodInvoker invoker;
         private final ExecutorService handlerExecutor;
-        private final TracingContextBridge tracing;
         private final ObjectProvider<SolaceListenerErrorHandler> errorHandlers;
         private final SolaceRequestReplyProperties props;
         private final List<SolaceMessageListenerContainer> containers = new ArrayList<>();
@@ -252,7 +232,6 @@ public class SolaceRequestReplyAutoConfiguration {
                                 SolaceSession session, RequestQueueProvisioner provisioner,
                                 PersistentPublisher publisher, PayloadCodec codec,
                                 HandlerMethodInvoker invoker, ExecutorService handlerExecutor,
-                                TracingContextBridge tracing,
                                 ObjectProvider<SolaceListenerErrorHandler> errorHandlers,
                                 SolaceRequestReplyProperties props) {
             this.postProcessor = postProcessor;
@@ -262,7 +241,6 @@ public class SolaceRequestReplyAutoConfiguration {
             this.codec = codec;
             this.invoker = invoker;
             this.handlerExecutor = handlerExecutor;
-            this.tracing = tracing;
             this.errorHandlers = errorHandlers;
             this.props = props;
         }
@@ -274,7 +252,7 @@ public class SolaceRequestReplyAutoConfiguration {
             for (SolaceListenerEndpoint endpoint : postProcessor.endpoints()) {
                 SolaceMessageListenerContainer container = new SolaceMessageListenerContainer(
                         endpoint, session, provisioner, publisher, codec, invoker,
-                        errorHandlers.getIfAvailable(), handlerExecutor, tracing,
+                        errorHandlers.getIfAvailable(), handlerExecutor,
                         props.getDmq().isEnabled() && props.getReplier().isDmqEligible(),
                         props.getReplier().resolveReplyTtlMillis(props.getRequest().getTimeout()));
                 container.start();

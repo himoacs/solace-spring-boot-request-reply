@@ -6,35 +6,24 @@ import java.time.Duration;
  * Requestor-side API, named after Spring Kafka's {@code ReplyingKafkaTemplate}.
  *
  * <p>Solace messages have no key, so the reply type moves to the method rather than the
- * class, matching Spring Kafka's own {@code ParameterizedTypeReference} overloads. The
- * {@code partitionKey} argument plays exactly the role a Kafka record key plays: it selects
- * the partition and therefore the ordering group.
+ * class, matching Spring Kafka's own {@code ParameterizedTypeReference} overloads.
  */
 public interface ReplyingSolaceTemplate {
 
     /**
      * Publishes {@code request} to {@code topic} and returns a future for the reply.
      *
-     * @param topic        request topic
-     * @param partitionKey partition key, or {@code null} for none. Ignored by a flat queue,
-     *                     so it is safe — and recommended — to always supply one: enabling
-     *                     partitioning later then needs no application change.
-     * @param payload      request body; serialized by the configured converter
-     * @param replyType    type to deserialize the reply into
-     * @param timeout      how long to wait before failing with {@code RequestTimeoutException}
+     * @param topic     request topic
+     * @param payload   request body; serialized by the configured converter
+     * @param replyType type to deserialize the reply into
+     * @param timeout   how long to wait before failing with {@code RequestTimeoutException}
      */
-    <T, R> RequestReplyFuture<R> sendAndReceive(String topic, String partitionKey, T payload,
+    <T, R> RequestReplyFuture<R> sendAndReceive(String topic, T payload,
                                                 Class<R> replyType, Duration timeout);
-
-    /** As above, with the partition key taken from the configured expression. */
-    default <T, R> RequestReplyFuture<R> sendAndReceive(String topic, T payload,
-                                                       Class<R> replyType, Duration timeout) {
-        return sendAndReceive(topic, null, payload, replyType, timeout);
-    }
 
     /** As above, using the configured default timeout. */
     default <T, R> RequestReplyFuture<R> sendAndReceive(String topic, T payload, Class<R> replyType) {
-        return sendAndReceive(topic, null, payload, replyType, defaultReplyTimeout());
+        return sendAndReceive(topic, payload, replyType, defaultReplyTimeout());
     }
 
     /**
@@ -48,9 +37,8 @@ public interface ReplyingSolaceTemplate {
                                                           Duration timeout);
 
     /** Typed form with an explicit correlation id, for replaying a request. */
-    <T, R> RequestReplyFuture<R> sendAndReceive(String topic, String partitionKey, T payload,
-                                               Class<R> replyType, Duration timeout,
-                                               String correlationId);
+    <T, R> RequestReplyFuture<R> sendAndReceive(String topic, T payload, Class<R> replyType,
+                                               Duration timeout, String correlationId);
 
     Duration defaultReplyTimeout();
 

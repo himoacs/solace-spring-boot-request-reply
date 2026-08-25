@@ -23,14 +23,13 @@ import static org.awaitility.Awaitility.await;
 /**
  * The test that protects the default configuration.
  *
- * <p>A temporary reply queue is destroyed once its linger window passes and is then recreated by
- * the broker <b>without its topic subscription</b>. In that state the session is up, the flow is
- * bound, the queue exists, nothing logs an error — and every request times out for ever. It is the
- * worst kind of failure: invisible, and permanent until someone restarts the process.
+ * <p>The reply queue is durable, so its topic subscription is a broker-side object that outlives
+ * the connection. Nothing in the library re-establishes anything after a reconnect — this test is
+ * what says that is actually safe rather than merely plausible, and it would fail loudly if the
+ * subscription did not survive.
  *
- * <p>{@code recreate-on-reconnect} exists to prevent it, and this is the only test that exercises
- * that path, because provoking it needs the connection severed from <em>outside</em> the client.
- * {@code closeSession()} will not do: that is a clean shutdown, not a reconnect.
+ * <p>The connection has to be severed from <em>outside</em> the client for the test to mean
+ * anything. {@code closeSession()} will not do: that is a clean shutdown, not a reconnect.
  */
 @SpringBootTest(classes = TestApp.class,
         webEnvironment = SpringBootTest.WebEnvironment.NONE,
@@ -39,10 +38,8 @@ import static org.awaitility.Awaitility.await;
                 "test.subscription=test/reconnect/request/v1/>",
                 "test.concurrency=2",
                 "solace.java.client-name=reconnect-test-client",
-                "solace.request-reply.reply.endpoint-type=TEMPORARY",
                 "solace.request-reply.reply.topic-pattern=test/reconnect/reply/v1/{instanceId}",
                 "solace.request-reply.reply.queue-name-pattern=q.test.reconnect.reply.{instanceId}",
-                "solace.request-reply.reply.recreate-on-reconnect=true",
                 "solace.request-reply.replier.queue=q.test.reconnect",
                 "solace.request-reply.replier.topics=test/reconnect/request/v1/>",
                 "solace.request-reply.replier.concurrency=2",
@@ -107,7 +104,7 @@ class ReplyPathReconnectIntegrationTest {
     }
 
     private String roundTrip(String value) throws Exception {
-        Map<?, ?> reply = template.sendAndReceive(TOPIC, "12951", Map.of("value", value),
+        Map<?, ?> reply = template.sendAndReceive(TOPIC, Map.of("value", value),
                 Map.class, Duration.ofSeconds(8)).get(12, TimeUnit.SECONDS);
         return String.valueOf(reply.get("echo"));
     }

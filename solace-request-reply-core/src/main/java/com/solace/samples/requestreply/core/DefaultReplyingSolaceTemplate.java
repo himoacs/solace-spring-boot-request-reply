@@ -40,11 +40,6 @@ import java.util.function.Function;
  * caller-registered continuation on it, and the guidance is explicit that listener callbacks
  * must return promptly — a slow {@code thenApply} would stall every other reply on this
  * instance. So completion is handed to a bounded application pool.
- *
- * <p>That pool is deliberately a plain JDK {@code ThreadPoolExecutor}. The OpenTelemetry agent
- * propagates context across executors by an exact class-name allowlist, and the JDK pools are
- * on it while a custom {@code Executor} would not be — so the ordinary choice is also the one
- * that keeps traces intact.
  */
 public class DefaultReplyingSolaceTemplate implements ReplyingSolaceTemplate, AutoCloseable {
 
@@ -62,19 +57,12 @@ public class DefaultReplyingSolaceTemplate implements ReplyingSolaceTemplate, Au
     private final PayloadCodec codec;
     private final ExecutorService completionExecutor;
     private final LatencyRecorder latency;
-    private final TracingContextBridge tracing;
 
     private final AtomicLong sequence = new AtomicLong();
     private final Map<String, Long> publishConfirmNanos = new java.util.concurrent.ConcurrentHashMap<>();
-    private final Expression partitionKeyExpression;
     private final Map<String, Expression> replyPlaceholderExpressions = new java.util.LinkedHashMap<>();
 
     private volatile FlowConsumer replyFlow;
-    /** correlation ids of in-flight canary probes, so replies to them are not treated as strays. */
-    private final Map<String, CompletableFuture<Void>> canaryWaiters =
-            new java.util.concurrent.ConcurrentHashMap<>();
-    private volatile boolean replyPathVerified;
-    private volatile String replyPathDetail = "not yet verified";
 
     public DefaultReplyingSolaceTemplate(SolaceSession session,
                                          ReplyEndpoint replyEndpoint,
@@ -83,8 +71,7 @@ public class DefaultReplyingSolaceTemplate implements ReplyingSolaceTemplate, Au
                                          SolaceRequestReplyProperties props,
                                          PayloadCodec codec,
                                          ExecutorService completionExecutor,
-                                         LatencyRecorder latency,
-                                         TracingContextBridge tracing) {
+                                         LatencyRecorder latency) {
         this.session = session;
         this.replyEndpoint = replyEndpoint;
         this.publisher = publisher;
@@ -93,9 +80,6 @@ public class DefaultReplyingSolaceTemplate implements ReplyingSolaceTemplate, Au
         this.codec = codec;
         this.completionExecutor = completionExecutor;
         this.latency = latency;
-        this.tracing = tracing;
-        String expr = props.getRequest().getPartitionKeyExpression();
-        this.partitionKeyExpression = (expr == null || expr.isBlank()) ? null : SPEL.parseExpression(expr);
         props.getReply().getPerRequestPlaceholderExpressions().forEach((name, spel) -> {
             if (spel != null && !spel.isBlank()) {
                 replyPlaceholderExpressions.put(name, SPEL.parseExpression(spel));
@@ -108,97 +92,18 @@ public class DefaultReplyingSolaceTemplate implements ReplyingSolaceTemplate, Au
 
     public void start() {
         publisher.start();
+        // Provisions the durable queue and applies its subscription. Both happen before the flow
+        // binds, so there is no window in which the endpoint exists but matches nothing.
         replyEndpoint.establish();
-        bindReplyFlow();
+        replyFlow = new FlowConsumer(session, replyEndpoint.queue(), "reply", false, this::onReplyMessage);
+        replyFlow.start();
         reaper.start();
-        session.onReconnect(this::onReconnect);
-        if (props.getReply().isCanaryOnReconnect()) {
-            // Also run it once at startup: a misconfigured topic pattern fails here rather than
-            // on the first real booking.
-            verifyReplyPath();
-        }
         log.info("Request/reply template ready. replyTopic={} subscription={}",
                 replyEndpoint.replyTopic(Map.of()), replyEndpoint.subscription());
     }
 
-    private void bindReplyFlow() {
-        replyFlow = new FlowConsumer(session, replyEndpoint.queue(), "reply", false, this::onReplyMessage);
-        replyFlow.start();
-        // Only now does the queue exist on the broker, so only now can it carry a subscription.
-        replyEndpoint.applySubscription();
-    }
 
-    /**
-     * Recovery after a reconnect: re-establish the endpoint, then rebind.
-     *
-     * <p>Load-bearing for a temporary endpoint, which the broker recreates without its
-     * subscription once the linger window expires. Without this the session is up, the flow is
-     * bound, nothing logs an error, and every request times out until someone restarts the pod.
-     */
-    private void onReconnect() {
-        if (!props.getReply().isRecreateOnReconnect()) { return; }
-        try {
-            replyEndpoint.reestablish();
-            if (replyFlow != null) { replyFlow.close(); }
-            bindReplyFlow();
-            log.info("Reply path re-established after reconnect");
-        } catch (RuntimeException ex) {
-            replyPathVerified = false;
-            replyPathDetail = "could not be re-established: " + ex.getMessage();
-            log.error("Reply path could not be re-established; this instance can no longer "
-                    + "receive replies and should be considered unhealthy", ex);
-            return;
-        }
-        if (props.getReply().isCanaryOnReconnect()) {
-            verifyReplyPath();
-        }
-    }
 
-    /**
-     * Sends a probe to this instance's own reply topic and waits for it to come back.
-     *
-     * <p>Re-establishing the endpoint can appear to succeed while the reply path is still broken.
-     * A temporary queue recreated after its linger window has no topic subscription, and in that
-     * state the session is connected, the flow is bound and nothing is logged, but no reply can
-     * ever arrive. Only a message that actually completes the round trip proves otherwise.
-     *
-     * @return true if the probe returned within the configured timeout
-     */
-    public boolean verifyReplyPath() {
-        String id = "canary-" + UUID.randomUUID();
-        CompletableFuture<Void> waiter = new CompletableFuture<>();
-        canaryWaiters.put(id, waiter);
-        String topic = replyEndpoint.replyTopic(Map.of());
-        try {
-            RequestReplyMessage probe = new RequestReplyMessage(new byte[0]);
-            probe.setCorrelationId(id);
-            // Deliberately left DMQ-ineligible. The probe carries a TTL, so marking it eligible
-            // would deposit a canary in the dead message queue on every reconnect and bury the
-            // real failures this feature exists to surface.
-            publisher.publish(topic, probe, null, props.getReply().getCanaryTimeout().toMillis());
-            waiter.get(props.getReply().getCanaryTimeout().toMillis(),
-                    java.util.concurrent.TimeUnit.MILLISECONDS);
-            replyPathVerified = true;
-            replyPathDetail = "verified by a round-trip probe";
-            log.info("Reply path verified: a probe published to '{}' came back", topic);
-            return true;
-        } catch (Exception ex) {
-            replyPathVerified = false;
-            replyPathDetail = "a probe published to '" + topic + "' did not return within "
-                    + props.getReply().getCanaryTimeout();
-            log.error("Reply path verification FAILED. {}. Replies cannot reach this instance, so "
-                    + "every request will time out. This is the state a temporary reply queue "
-                    + "enters when it is recreated without its subscription.", replyPathDetail);
-            return false;
-        } finally {
-            canaryWaiters.remove(id);
-        }
-    }
-
-    /** Whether the last verification succeeded. Reported by the health indicator. */
-    public boolean isReplyPathVerified() { return replyPathVerified; }
-
-    public String replyPathDetail() { return replyPathDetail; }
 
     @Override
     public boolean waitForReplyEndpoint(Duration timeout) {
@@ -224,20 +129,19 @@ public class DefaultReplyingSolaceTemplate implements ReplyingSolaceTemplate, Au
     // ------------------------------------------------------------------ sending
 
     @Override
-    public <T, R> RequestReplyFuture<R> sendAndReceive(String topic, String partitionKey, T payload,
+    public <T, R> RequestReplyFuture<R> sendAndReceive(String topic, T payload,
                                                        Class<R> replyType, Duration timeout) {
-        return sendAndReceive(topic, partitionKey, payload, replyType, timeout, null);
+        return sendAndReceive(topic, payload, replyType, timeout, null);
     }
 
     @Override
-    public <T, R> RequestReplyFuture<R> sendAndReceive(String topic, String partitionKey, T payload,
+    public <T, R> RequestReplyFuture<R> sendAndReceive(String topic, T payload,
                                                        Class<R> replyType, Duration timeout,
                                                        String correlationId) {
         RequestReplyMessage request = new RequestReplyMessage(codec.serialize(payload));
         if (correlationId != null && !correlationId.isBlank()) {
             request.setCorrelationId(correlationId);
         }
-        request.setPartitionKey(partitionKey != null ? partitionKey : derivePartitionKey(payload));
         // Reply-topic placeholders are derived here, where the typed payload is still available;
         // by the time the raw path runs the payload is opaque bytes.
         replyPlaceholderExpressions.forEach((name, expr) -> {
@@ -270,7 +174,7 @@ public class DefaultReplyingSolaceTemplate implements ReplyingSolaceTemplate, Au
         // before the publish acknowledgement arrives, and registering afterwards would drop it.
         store.register(new PendingRequest(correlationId, topic,
                 System.currentTimeMillis() + timeout.toMillis(), timeout.toMillis(), startNanos,
-                future, tracing.captureCurrent()));
+                future));
 
         ticket.sendFuture().whenComplete((res, err) -> {
             if (res != null) {
@@ -294,18 +198,6 @@ public class DefaultReplyingSolaceTemplate implements ReplyingSolaceTemplate, Au
         return future;
     }
 
-    private String derivePartitionKey(Object payload) {
-        if (partitionKeyExpression == null || payload == null) { return null; }
-        try {
-            Object v = partitionKeyExpression.getValue(payload);
-            return v == null ? null : String.valueOf(v);
-        } catch (RuntimeException ex) {
-            log.warn("partition-key-expression failed against {}; publishing without a key. "
-                    + "On a partitioned queue the broker will assign a random partition, which "
-                    + "silently loses ordering.", payload.getClass().getSimpleName(), ex);
-            return null;
-        }
-    }
 
     private Map<String, String> perRequestPlaceholderValues(RequestReplyMessage request) {
         Map<String, String> out = new HashMap<>();
@@ -336,13 +228,6 @@ public class DefaultReplyingSolaceTemplate implements ReplyingSolaceTemplate, Au
         RequestReplyMessage reply = InboundMessage.toModel(msg);
         String correlationId = reply.getCorrelationId();
 
-        // Canary probes are not real requests, so they are never in the correlation store and
-        // would otherwise be logged as strays.
-        CompletableFuture<Void> canary = canaryWaiters.remove(correlationId);
-        if (canary != null) {
-            canary.complete(null);
-            return;
-        }
 
         store.remove(correlationId).ifPresentOrElse(pending -> {
             long total = System.nanoTime() - pending.getStartNanos();
@@ -355,16 +240,16 @@ public class DefaultReplyingSolaceTemplate implements ReplyingSolaceTemplate, Au
             latency.record(new LatencySample(correlationId, outcome, total, confirm, handler,
                     dispatchDelayNanos, reply.getSequence()));
 
-            // Off the dispatch thread, with the request's context restored so the trace's
-            // parent is the span that issued the request, not the one that received the reply.
-            completionExecutor.execute(tracing.wrap(pending.getTracingContext(), () -> {
+            // Off the dispatch thread: completing here would run every dependent stage of the
+            // caller's future on JCSMP's, stalling delivery for every other reply.
+            completionExecutor.execute(() -> {
                 if (reply.isError()) {
                     pending.getFuture().completeExceptionally(
                             new RemoteErrorException(correlationId, reply.getErrorMessage()));
                 } else {
                     pending.getFuture().complete(reply);
                 }
-            }));
+            });
         }, () -> log.debug("Uncorrelated reply correlationId={} — already timed out, a duplicate, "
                 + "or addressed to a previous incarnation of this instance", correlationId));
     }
@@ -385,8 +270,7 @@ public class DefaultReplyingSolaceTemplate implements ReplyingSolaceTemplate, Au
     }
 
     private void completeExceptionally(PendingRequest pending, Throwable cause) {
-        completionExecutor.execute(tracing.wrap(pending.getTracingContext(),
-                () -> pending.getFuture().completeExceptionally(cause)));
+        completionExecutor.execute(() -> pending.getFuture().completeExceptionally(cause));
     }
 
     private static long parseLong(String s) {

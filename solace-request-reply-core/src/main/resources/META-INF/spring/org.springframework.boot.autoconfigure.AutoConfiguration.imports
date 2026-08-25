@@ -1,2 +1,1 @@
 com.solace.samples.requestreply.config.SolaceRequestReplyAutoConfiguration
-com.solace.samples.requestreply.tracing.SolaceTracingAutoConfiguration

@@ -40,7 +40,6 @@ solace:
       # Without this a queued request can outlive the requestor's patience and be acted on
       # after nobody is waiting — a reservation the customer never sees confirmed.
       ttl-matches-timeout: true
-      partition-key-expression: "partitionKey()"
       sequence-numbers: true
       # Needed on brokers before 10.25.10, which move only eligible messages to the DMQ. From
       # 10.25.10 the broker moves everything, so setting it is what makes behaviour identical
@@ -48,13 +47,9 @@ solace:
       dmq-eligible: true
 
     reply:
-      # TEMPORARY needs no provisioning and leaves nothing behind, which is why it is the
-      # default -- and, with recreate-on-reconnect and canary-on-reconnect below, a sound
-      # production choice in its own right. DURABLE is the alternative rather than the
-      # upgrade: a broker-side subscription that survives on its own, and a queue that keeps
-      # spooling replies while the requestor is disconnected, in exchange for owning its
-      # lifecycle.
-      endpoint-type: TEMPORARY
+      # Reply queues are durable: the subscription is a broker-side object that survives a
+      # reconnect on its own, and the queue keeps spooling replies while this instance is
+      # disconnected rather than discarding them.
       topic-pattern: "cris/booking/seatReserve/reply/v1/{zone}/{trainNo}/{instanceId}"
       # trainNo is filled in per request and wildcarded in the subscription, so one
       # subscription covers every train while the topic still names the one in play.
@@ -67,8 +62,11 @@ solace:
       placeholders:
         zone: nr
       queue-name-pattern: "q.cris.booking.reply.{instanceId}"
-      recreate-on-reconnect: true
-      canary-on-reconnect: true
+      # instance-id defaults to the hostname, which is the pod name on Kubernetes. It must be
+      # unique per instance and stable across restarts: the reply queue is durable and
+      # exclusive, so two instances sharing an id bind the same queue and the second silently
+      # receives nothing. Set it explicitly to run several instances on one host.
+      # instance-id: booking-1
       wait-for-endpoint: 15s
       quota-mb: 100
 
@@ -91,38 +89,18 @@ solace:
         max-redelivery: 3
         respects-ttl: true
         discard-notify-sender: true
-      partitioning:
-        # 0 is a flat queue: simplest, no SEMP, and no loss of selectors, browsing or replay.
-        # Above 0 requires SEMP, because JCSMP cannot express a partition count at any version.
-        partition-count: 0
-        rebalance-delay: 5s
-        rebalance-max-handoff-time: 3s
-        # This library's own guard, not a broker setting: the queue object has only
-        # partitionCount, partitionRebalanceDelay and partitionRebalanceMaxHandoffTime.
-        # It decides whether a count mismatch is a startup failure or a SEMP resize.
-        allow-partition-resize: false
-        semp:
-          url: ${SEMP_URL:}
-          username: ${SEMP_USER:}
-          password: ${SEMP_PASS:}
-          msg-vpn: ${SOLACE_VPN:default}
 
     dmq:
       # On by default. Without a dead message queue the broker DELETES a request that expires or
       # exhausts its redeliveries -- a booking lost with no trace of it anywhere.
       enabled: true
-      # The Message VPN default, which every queue already points at, so no SEMP is needed and
-      # temporary reply queues are covered too. Dead-lettered messages keep their original topic,
-      # so requests and replies stay distinguishable in here.
+      # The Message VPN default, which every queue already points at, so nothing has to be set
+      # per endpoint. Dead-lettered messages keep their original topic, so requests and replies
+      # stay distinguishable in here.
       name: "#DEAD_MSG_QUEUE"
       provision: true
       quota-mb: 1000
 
-    tracing:
-      # Off by default, and inert even when true unless the OpenTelemetry libraries are present.
-      # Set true plus add opentelemetry-api and solace-opentelemetry-jcsmp-integration to enable.
-      enabled: ${TRACING_ENABLED:false}
-      propagate-context: true
 
 booking:
   topics:

@@ -36,7 +36,7 @@ curl -s -X POST http://localhost:8091/api/bookings \
   "reservation": { "pnr": "0841866636", "status": "CONFIRMED", "coach": "B3", "berths": "1,2" },
   "latency":     { "totalMicros": 23322, "publishConfirmMicros": 12581 },
   "requestTopic": "cris/booking/seatReserve/request/v1/nr/12951",
-  "partitionKey": "12951-2026-09-15-3a"
+  "inventoryRow": "12951-2026-09-15-3a"
 }
 ```
 
@@ -157,9 +157,6 @@ discriminator in the topic instead.
 + cris/booking/seatReserve/reply/v1/nr/*/client-0
 ```
 
-Moving off selectors is also a prerequisite for partitioned queues. JCSMP defines the error subcode
-`SELECTORS_NOT_SUPPORTED_ON_PARTITIONED_QUEUE`, because the broker does not support both features on
-the same queue.
 
 ### Why the reply topic includes the train number
 
@@ -219,46 +216,44 @@ solace:
 ```
 
 Everything else has a default. The defaults are chosen so that a first run against a fresh broker
-works without any provisioning: the reply endpoint is temporary, and the request queue is created
-if it does not exist.
+works without provisioning anything by hand: the reply queue, the request queue and the dead
+message queue are all created if they do not exist.
 
 ### The settings worth deciding deliberately
 
 | Setting | Default | Why it matters |
 |---|---|---|
-| `reply.endpoint-type` | `TEMPORARY` | Both are production-viable. `TEMPORARY` needs no provisioning, leaves nothing behind and is the lower-maintenance option; the reconnect handling below is what makes it safe. `DURABLE` keeps the subscription as a broker-side object and spools replies while the requestor is disconnected, at the cost of owning a queue's lifecycle. |
-| `replier.partitioning.partition-count` | `0` (flat) | A flat queue needs no SEMP access and keeps selectors, queue browsing and replay, but gives no ordering. Above zero serialises requests that share a partition key. |
+| `reply.instance-id` | hostname | Must be unique per instance and stable across restarts. The reply queue is durable and exclusive, so two instances sharing an id bind the same queue and the second silently receives nothing. |
 | `request.ttl-matches-timeout` | `true` | Stops a replier acting on a request after the requestor has given up. Turning it off can produce work nobody is waiting for. |
 | `replier.provision.max-redelivery` | `3` | Zero means redeliver forever, so one malformed message loops indefinitely. |
 | `java.reconnect-retries` | — | Set this to at least 100 with a 3000 ms wait, which gives the 300 seconds needed to survive an HA failover. The commonly copied value of 20 only gives 60 seconds. |
 | `dmq.enabled` | `true` | On, because the alternative is deleting a message the system failed to process. Turning it off restores silent discard. |
 | `replier.reply-ttl` | follows `request.timeout` | Bounds how long an undeliverable reply lingers. Set `0s` to keep replies forever, at the cost of orphaned queues growing. |
-| `tracing.enabled` | `false` | See [Distributed tracing](#distributed-tracing). |
 
-### The temporary queue hazard
+### The reply queue is durable, exclusive, and named after the instance
 
-A temporary reply queue survives a disconnect for 60 seconds, or 180 seconds across a broker
-failover. After that the broker destroys it. When the client reconnects, the broker recreates the
-queue but does not restore its topic subscription.
+Each requestor instance owns one durable reply queue, `q.…reply.{instanceId}`, bound exclusively.
+Exclusive because a reply is addressed rather than shared: the `CompletableFuture` waiting for it
+lives in one JVM's heap and no other process can complete it.
 
-In that state the session is connected, the flow is bound, the queue exists, and nothing is logged.
-Every request times out until the process is restarted.
+That makes `instanceId` load-bearing, and it defaults to the hostname — the pod name on Kubernetes.
+Two failure modes follow directly, and neither announces itself:
 
-Two settings deal with this. `recreate-on-reconnect` redoes the whole sequence after a reconnect.
-`canary-on-reconnect` then publishes a probe to this instance's own reply topic and requires it to
-come back, which is the only check that proves a message can actually complete the round trip. The
-result is reported through the reply-path health indicator, so a readiness probe can remove the
-instance rather than leaving it to accept requests it cannot answer.
+- **Two instances resolving the same id** bind the same exclusive queue. The second becomes a
+  standby that receives nothing, and every one of its requests times out with no error logged. Set
+  `reply.instance-id` explicitly when running more than one instance on a host.
+- **An id that changes between runs** strands the previous queue on the broker, still spooling
+  replies nobody will read. The hostname is stable across a restart, which is why the default no
+  longer carries a random suffix.
 
-Handled, and — the part that matters — *visible*: the canary turns a silent failure into a health
-check a readiness probe can act on. `TEMPORARY` is a sound production choice on that basis, and the
-lower-maintenance one, since there is no endpoint to provision or clean up.
+The endpoint is logged at startup so the resolved value is never a guess:
 
-`DURABLE` sidesteps this particular sequence, because the subscription is a broker-side object that
-does not need reapplying, and a durable queue also keeps spooling replies while the requestor is
-disconnected rather than discarding them. That is a different trade, not a better default: you take
-on the queue's lifecycle in exchange. Choose on whether you want replies to survive a requestor
-outage and whether your operational model prefers endpoints declared up front.
+```
+Reply endpoint identity: instanceId=pod-0 queue=q.cris.booking.reply.pod-0
+```
+
+The queue is provisioned and subscribed before any flow binds, so a reply published in the gap
+between startup and binding is spooled rather than lost.
 
 ### Provisioning modes
 
@@ -269,11 +264,6 @@ ignored. `FLAG_IGNORE_ALREADY_EXISTS` only suppresses the "already exists" error
 exists with different properties, JCSMP raises `PropertyMismatchException`, which names the property
 that differs. This was verified against a live broker; see [spike/README.md](spike/README.md).
 
-Partition counts are the exception. JCSMP cannot express one, so a partitioned queue is created or
-verified over SEMP, using the management credentials under
-`replier.partitioning.semp`. A count that does not match is a startup failure rather
-than something the application changes on its own, because Solace requires the queue to be drained
-first and reducing the count deletes the messages held in the removed partitions.
 
 ### Dead message queues
 
@@ -297,11 +287,9 @@ solace:
 ```
 
 **One shared queue, deliberately.** A DMQ per endpoint would need `deadMsgQueue` set on each source
-queue over SEMP, and temporary reply queues cannot carry that setting at all — they are not
-SEMP-configurable objects. Every queue already points at `#DEAD_MSG_QUEUE`, so using it needs no
-management credentials and behaves identically for temporary and durable reply endpoints.
-Dead-lettered messages keep their original topic, so `…/request/v1/…` and `…/reply/v1/…` remain easy
-to tell apart when you inspect the queue.
+queue over SEMP. Every queue already points at `#DEAD_MSG_QUEUE`, so using it needs no management
+credentials at all. Dead-lettered messages keep their original topic, so `…/request/v1/…` and
+`…/reply/v1/…` remain easy to tell apart when you inspect the queue.
 
 The DMQ is provisioned with `respectsMsgTTL=false`. These messages are here *because* they expired;
 honouring their TTL again would expire them straight back out of the one place they are meant to
@@ -322,9 +310,8 @@ Less obvious than it looks, and worth knowing before you go hunting for a messag
 | Reply published, requestor already gone, `reply-ttl` elapsed | yes |
 | Handler throws | **no** — that becomes an error reply, and the request is acknowledged |
 | Handler returns `null` (the demo's `simulate=timeout`) | **no** — it declines to reply but still acknowledges |
-| Reply-path canary probe | **no** — deliberately ineligible, or every reconnect would deposit one |
 
-The last three are the ones that surprise people. "The requestor timed out" and "the request was
+The last two are the ones that surprise people. "The requestor timed out" and "the request was
 dead-lettered" are different events: a handler that runs to completion and simply says nothing has
 consumed the request quite legitimately, so there is nothing left to dead-letter.
 
@@ -362,75 +349,8 @@ curl -s -u admin:admin \
 ```
 
 `GET /api/diagnostics/endpoints` reports a `dmq` block with `configuredEnabled` and `established`
-separately, for the same reason tracing does: dead-lettering can be switched on and still be inert if
-the queue could not be created.
-
----
-
-## Distributed tracing
-
-Tracing is disabled by default. Three conditions must all be true for it to become active:
-
-1. `solace.request-reply.tracing.enabled` is `true`,
-2. the OpenTelemetry API is on the classpath, and
-3. no `TracingContextBridge` bean is already defined.
-
-If any of them is false, the library uses a no-op bridge that captures nothing and allocates no
-wrappers. The OpenTelemetry dependencies are declared as optional, so a project that leaves tracing
-disabled does not carry them at all.
-
-```yaml
-solace:
-  request-reply:
-    tracing:
-      enabled: false           # set to true to activate
-      propagate-context: true  # carry W3C trace context between processes
-```
-
-`GET /api/diagnostics/endpoints` reports `configuredEnabled` and `active` separately, because
-tracing can be switched on and still be inactive if the libraries are missing.
-
-To enable it, add the dependencies and set the flag:
-
-```xml
-<dependency>
-  <groupId>io.opentelemetry</groupId>
-  <artifactId>opentelemetry-api</artifactId>
-</dependency>
-<dependency>
-  <!-- JCSMP has its own integration library, separate from the newer Java API's. -->
-  <groupId>com.solace</groupId>
-  <artifactId>solace-opentelemetry-jcsmp-integration</artifactId>
-</dependency>
-```
-
-### What tracing adds
-
-It does two separate things.
-
-**Capturing and restoring context** keeps a trace correctly parented. `future.complete()` runs its
-dependent stages on whichever thread completed it, and that thread holds the context of the reply.
-The span that should be the parent is the one that was active when the request was sent. The library
-stores the request's context in `PendingRequest` and restores it when completing the future.
-
-**Injecting and extracting context** carries the trace across processes, so the requestor and replier
-appear in one trace instead of two. This part needs the Solace integration library. If it is absent,
-the in-process behaviour above still works and the library logs a warning explaining what is missing.
-
-Broker-generated spans put both ends of a queue dwell measurement on the broker's own clock, which
-removes clock skew from the result. Those require a telemetry profile on the broker and an
-OpenTelemetry Collector configured with the Solace receiver. That setup is outside the scope of this
-sample.
-
-### Tracing and the handler executors
-
-The handler and the future completion both run on bounded executors rather than on the JCSMP dispatch
-thread. OpenTelemetry stores context in a thread local, and the Java agent propagates it across
-executors using a list of known executor class names. `ThreadPoolExecutor` is on that list; a custom
-`Executor` implementation is not.
-
-Both executors here are plain JDK thread pools, so propagation works without extra configuration. If
-you replace them with a custom `Executor`, context propagation will stop working silently.
+separately, because dead-lettering can be switched on and still be inert: a queue that could not be
+created means the broker goes back to deleting.
 
 ---
 
@@ -441,25 +361,23 @@ you replace them with a custom `Executor`, context propagation will stop working
 | `ReplyingKafkaTemplate` | `ReplyingSolaceTemplate` |
 | `sendAndReceive(...)` returning `RequestReplyFuture` | same names |
 | `getSendFuture()` returning `SendResult` | `getSendFuture()` returning `PublishResult` |
-| `ProducerRecord` key | `QUEUE_PARTITION_KEY` user property |
 | `@KafkaListener(topics = …)` | `@SolaceListener(queue = …, topics = …)` |
 | consumer `groupId` | `queue`, since a non-exclusive queue is the consumer group |
 | `@SendTo` | `@SendTo`, Spring's own annotation |
 | `KafkaHeaders.CORRELATION_ID` | `SolaceHeaders.CORRELATION_ID`, a native SMF field |
-| `KafkaHeaders.REPLY_PARTITION` | not needed, because each instance has its own reply topic |
 | `spring.kafka.*` | `solace.java.*` and `solace.request-reply.*` |
 
 ### Differences that matter
 
 | Concept | Kafka behaviour | Solace behaviour |
 |---|---|---|
-| Ordering | guaranteed within a partition | the queue itself preserves order. Order is lost only when several consumer flows bind to one queue and process in parallel — which is exactly what `concurrency` above 1 does. Keep it with one queue per consumer (queues are cheap in Solace, so fanning a topic subscription out to several is a normal pattern), or use a partitioned queue when you want sticky key-based balancing instead. |
+| Ordering | guaranteed within a partition | the queue itself preserves order. Order is lost only when several consumer flows bind to one queue and process in parallel — which is exactly what `concurrency` above 1 does. Keep it by giving each consumer its own queue; queues are cheap in Solace, so fanning one topic subscription out to several is a normal pattern. |
 | Provisioning | you provision topics | the reverse. Topics are just strings and need no setup, while queues are objects with permissions. |
 | Replay | messages are retained by time or size, and you can seek | a queue drains as messages are acknowledged. Reprocessing needs the separate Message Replay feature. |
-| Rebalancing | partitions are reassigned in a stop-the-world rebalance | messages are distributed one at a time across bound flows. Adding an instance takes effect immediately. |
+| Rebalancing | partitions are reassigned in a stop-the-world rebalance | messages are distributed one at a time across the bound flows. Adding an instance takes effect immediately, with no rebalance. |
 | Filtering | topic names are flat, so consumers filter in the application | topics are hierarchical and the broker filters per message. |
 | Dead letters | a client-side recoverer republishes to a `.DLT` topic | the broker moves messages to a dead message queue, with no client code involved. On by default here; see [Dead message queues](#dead-message-queues). |
-| Queue browsing | not applicable | not available on a partitioned queue. |
+| Queue browsing | not applicable | a queue can be browsed non-destructively, which is how you inspect the DMQ. |
 
 ---
 
@@ -552,19 +470,17 @@ The report always states which mode produced it.
 ./mvnw test        # starts a broker with Testcontainers
 ```
 
-Sixteen integration tests run against a real broker. The behaviour that matters here belongs to the
+Twelve integration tests run against a real broker. The behaviour that matters here belongs to the
 interaction with the broker, so a test that mocked it would not catch the problems these are written
 to catch.
 
 | Test | What it checks |
 |---|---|
 | `RequestReplyIntegrationTest` | a round trip; the send future resolving independently of the reply; one request producing exactly one unit of work despite three competing flows; a replayed correlation id not repeating the work; 60 concurrent requests correlated correctly; a timed-out request being evicted |
-| `ReplyPathReconnectIntegrationTest` | replies still arrive after the connection is cut from outside using SEMP. Without re-subscription the queue would exist, the flow would be bound, nothing would be logged, and every request would time out. |
+| `ReplyPathReconnectIntegrationTest` | replies still arrive after the connection is cut from outside using SEMP, with no re-establish logic in play — which is what a durable, broker-side subscription buys. |
 | `ProvisionDriftIntegrationTest` | re-provisioning with identical properties is a no-op; differing properties raise `PropertyMismatchException`; the ignore flag only suppresses "already exists" |
-| `PartitionedQueueIntegrationTest` | SEMP creates a partitioned queue; resizing is refused unless explicitly allowed, because a decrease deletes messages; a clear error when SEMP is not configured |
-| `ReplyPathCanaryIntegrationTest` | the probe completes and health reports UP; when the subscription is removed behind the library's back, the probe fails and health reports DOWN; re-applying the subscription restores it |
 | `MinimalConfigIntegrationTest` | the minimal configuration shown in this README actually round-trips, so the example cannot rot |
-| `TracingToggleIntegrationTest` | tracing is off by default and active when configured |
+| `DmqIntegrationTest` | the DMQ is provisioned at startup; an expired request is kept there rather than deleted, carrying the published eligibility flag; reply TTL derives from `request.timeout` unless set |
 
 The tests use `GenericContainer` rather than the Testcontainers Solace module. The module rejects
 `default` as a client username, and does not set `container=docker` or a large enough shared memory
@@ -583,11 +499,10 @@ container to become healthy.
 solace-request-reply-core/     the reusable library
   api/         ReplyingSolaceTemplate, RequestReplyFuture, @SolaceListener, SolaceHeaders
   core/        template, correlation store, timeout reaper, payload codec
-  endpoint/    reply endpoints, request queue provisioner, SEMP client
+  endpoint/    durable reply endpoint, request queue and DMQ provisioners
   transport/   session, publisher with acknowledgement handling, flow consumer
   listener/    @SolaceListener discovery and container
   latency/     segment measurement, exact percentiles, histogram rendering
-  tracing/     optional OpenTelemetry bridge
 
 booking-demo/                  the runnable sample
 docker/                        local broker

@@ -22,11 +22,10 @@ public final class PendingRequest {
     private final long startNanos;
     private final long publishConfirmNanosHolder;
     private final CompletableFuture<RequestReplyMessage> future;
-    private final Object tracingContext;
 
     public PendingRequest(String correlationId, String requestTopic, long deadlineEpochMs,
                           long timeoutMs, long startNanos,
-                          CompletableFuture<RequestReplyMessage> future, Object tracingContext) {
+                          CompletableFuture<RequestReplyMessage> future) {
         this.correlationId = correlationId;
         this.requestTopic = requestTopic;
         this.deadlineEpochMs = deadlineEpochMs;
@@ -34,7 +33,6 @@ public final class PendingRequest {
         this.startNanos = startNanos;
         this.publishConfirmNanosHolder = 0L;
         this.future = future;
-        this.tracingContext = tracingContext;
     }
 
     public String getCorrelationId() { return correlationId; }
@@ -43,7 +41,6 @@ public final class PendingRequest {
     public long getTimeoutMs() { return timeoutMs; }
     public long getStartNanos() { return startNanos; }
     public CompletableFuture<RequestReplyMessage> getFuture() { return future; }
-    public Object getTracingContext() { return tracingContext; }
 
     public boolean isExpired(long nowEpochMs) { return nowEpochMs >= deadlineEpochMs; }
 }

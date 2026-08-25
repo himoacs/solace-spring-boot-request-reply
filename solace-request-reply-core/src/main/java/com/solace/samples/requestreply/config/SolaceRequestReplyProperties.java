@@ -26,8 +26,6 @@ public class SolaceRequestReplyProperties {
     @NestedConfigurationProperty
     private final Replier replier = new Replier();
     @NestedConfigurationProperty
-    private final TracingProperties tracing = new TracingProperties();
-    @NestedConfigurationProperty
     private final Dmq dmq = new Dmq();
 
     public boolean isEnabled() { return enabled; }
@@ -35,7 +33,6 @@ public class SolaceRequestReplyProperties {
     public Request getRequest() { return request; }
     public Reply getReply() { return reply; }
     public Replier getReplier() { return replier; }
-    public TracingProperties getTracing() { return tracing; }
     public Dmq getDmq() { return dmq; }
 
     // ------------------------------------------------------------------ request
@@ -51,11 +48,6 @@ public class SolaceRequestReplyProperties {
          * nobody is waiting, producing a reservation the customer never sees confirmed.
          */
         private boolean ttlMatchesTimeout = true;
-        /**
-         * SpEL over the payload producing the partition key. Overridden by an explicit
-         * argument to {@code sendAndReceive}.
-         */
-        private String partitionKeyExpression;
         /** Stamp a monotonic sequence number, enabling gap and reorder detection. */
         private boolean sequenceNumbers = true;
         /**
@@ -75,8 +67,6 @@ public class SolaceRequestReplyProperties {
         public void setDeliveryMode(String v) { this.deliveryMode = v; }
         public boolean isTtlMatchesTimeout() { return ttlMatchesTimeout; }
         public void setTtlMatchesTimeout(boolean v) { this.ttlMatchesTimeout = v; }
-        public String getPartitionKeyExpression() { return partitionKeyExpression; }
-        public void setPartitionKeyExpression(String v) { this.partitionKeyExpression = v; }
         public boolean isSequenceNumbers() { return sequenceNumbers; }
         public void setSequenceNumbers(boolean v) { this.sequenceNumbers = v; }
         public boolean isDmqEligible() { return dmqEligible; }
@@ -85,25 +75,7 @@ public class SolaceRequestReplyProperties {
 
     // -------------------------------------------------------------------- reply
 
-    public enum ReplyEndpointType {
-        /**
-         * Broker-generated, auto-deleted. No provisioning and nothing to clean up, which is
-         * why it is the default. Costs one hazard: the queue lingers only 60s after a
-         * disconnect (180s across an HA failover) and is then recreated <em>without</em> its
-         * subscription, so {@code recreate-on-reconnect} and the canary are load-bearing here.
-         */
-        TEMPORARY,
-        /**
-         * Provisioned and durable. The subscription is a broker-side object and survives
-         * reconnects outright. Recommended for production, at the cost of needing a stable
-         * instance identity and an orphan-drain policy.
-         */
-        DURABLE
-    }
-
     public static class Reply {
-        private ReplyEndpointType endpointType = ReplyEndpointType.TEMPORARY;
-
         /**
          * Reply topic pattern. {@code {placeholders}} are substituted per request; those
          * named in {@link #perRequestPlaceholders} become {@code *} in the subscription and
@@ -128,29 +100,27 @@ public class SolaceRequestReplyProperties {
         /** Static placeholder values, e.g. {@code zone: nr}. */
         private java.util.Map<String, String> placeholders = new java.util.LinkedHashMap<>();
 
-        /** Instance identity. Blank resolves to hostname plus a short random suffix. */
+        /**
+         * Instance identity, substituted into the reply topic and queue name. Blank resolves to
+         * the hostname, which is the pod name on Kubernetes.
+         *
+         * <p>Must be unique per instance and stable across restarts. The reply queue is durable
+         * and exclusive, so two instances sharing an id bind the same queue and the second
+         * silently receives nothing, while an id that changes between runs strands the previous
+         * queue on the broker. Set this explicitly when running several instances on one host.
+         */
         private String instanceId = "";
 
         /** Queue name pattern; {@code {instanceId}} is substituted. */
         private String queueNamePattern = "q.requestreply.reply.{instanceId}";
 
-        /** Re-provision, re-subscribe and re-bind after every reconnect. */
-        private boolean recreateOnReconnect = true;
 
-        /**
-         * After reconnect, publish a probe to our own reply topic and require it back.
-         * Turns the temporary-queue silent-death mode into a detectable failure.
-         */
-        private boolean canaryOnReconnect = true;
-        private Duration canaryTimeout = Duration.ofSeconds(10);
 
         /** How long {@code waitForReplyEndpoint} blocks at startup. */
         private Duration waitForEndpoint = Duration.ofSeconds(10);
 
         private int quotaMb = 100;
 
-        public ReplyEndpointType getEndpointType() { return endpointType; }
-        public void setEndpointType(ReplyEndpointType v) { this.endpointType = v; }
         public String getTopicPattern() { return topicPattern; }
         public void setTopicPattern(String v) { this.topicPattern = v; }
         public List<String> getPerRequestPlaceholders() { return perRequestPlaceholders; }
@@ -167,12 +137,6 @@ public class SolaceRequestReplyProperties {
         public void setInstanceId(String v) { this.instanceId = v; }
         public String getQueueNamePattern() { return queueNamePattern; }
         public void setQueueNamePattern(String v) { this.queueNamePattern = v; }
-        public boolean isRecreateOnReconnect() { return recreateOnReconnect; }
-        public void setRecreateOnReconnect(boolean v) { this.recreateOnReconnect = v; }
-        public boolean isCanaryOnReconnect() { return canaryOnReconnect; }
-        public void setCanaryOnReconnect(boolean v) { this.canaryOnReconnect = v; }
-        public Duration getCanaryTimeout() { return canaryTimeout; }
-        public void setCanaryTimeout(Duration v) { this.canaryTimeout = v; }
         public Duration getWaitForEndpoint() { return waitForEndpoint; }
         public void setWaitForEndpoint(Duration v) { this.waitForEndpoint = v; }
         public int getQuotaMb() { return quotaMb; }
@@ -220,8 +184,6 @@ public class SolaceRequestReplyProperties {
 
         @NestedConfigurationProperty
         private final Provision provision = new Provision();
-        @NestedConfigurationProperty
-        private final Partitioning partitioning = new Partitioning();
 
         public String getQueue() { return queue; }
         public void setQueue(String v) { this.queue = v; }
@@ -232,7 +194,6 @@ public class SolaceRequestReplyProperties {
         public int getConcurrency() { return concurrency; }
         public void setConcurrency(int v) { this.concurrency = v; }
         public Provision getProvision() { return provision; }
-        public Partitioning getPartitioning() { return partitioning; }
         public boolean isDmqEligible() { return dmqEligible; }
         public void setDmqEligible(boolean v) { this.dmqEligible = v; }
         public Duration getReplyTtl() { return replyTtl; }
@@ -266,42 +227,6 @@ public class SolaceRequestReplyProperties {
         public void setDiscardNotifySender(boolean v) { this.discardNotifySender = v; }
     }
 
-    public static class Partitioning {
-        /**
-         * 0 is a flat queue. Above 0 expects a partitioned queue, which JCSMP cannot
-         * provision — {@code EndpointProperties} has no partition member at any version — so
-         * it is created or verified over SEMP.
-         *
-         * <p>Sizing, per Solace's guidance: the maximum number of consumers you expect to
-         * bind. Concurrency 10 across 3 pods is 30 flows, so 32.
-         */
-        private int partitionCount = 0;
-        private Duration rebalanceDelay = Duration.ofSeconds(5);
-        private Duration rebalanceMaxHandoffTime = Duration.ofSeconds(3);
-        /** Permit a destructive partition-count change. Off, because decreasing deletes messages. */
-        private boolean allowPartitionResize = false;
-
-        @NestedConfigurationProperty
-        private final Semp semp = new Semp();
-
-        public int getPartitionCount() { return partitionCount; }
-        public void setPartitionCount(int v) { this.partitionCount = v; }
-        public Duration getRebalanceDelay() { return rebalanceDelay; }
-        public void setRebalanceDelay(Duration v) { this.rebalanceDelay = v; }
-        public Duration getRebalanceMaxHandoffTime() { return rebalanceMaxHandoffTime; }
-        public void setRebalanceMaxHandoffTime(Duration v) { this.rebalanceMaxHandoffTime = v; }
-        public boolean isAllowPartitionResize() { return allowPartitionResize; }
-        public void setAllowPartitionResize(boolean v) { this.allowPartitionResize = v; }
-        public Semp getSemp() { return semp; }
-    }
-
-    /**
-     * SEMP access, consulted only when {@code partitionCount > 0}.
-     *
-     * <p>These are <b>management</b> credentials, not the messaging ones. In production this
-     * bootstrap belongs in an init container or Terraform so the running application never
-     * holds them and can run with {@code VALIDATE} alone.
-     */
     /**
      * The dead message queue: where the broker puts a message it has given up on, instead of
      * deleting it.
@@ -311,11 +236,11 @@ public class SolaceRequestReplyProperties {
      * existing — or the broker deletes it. <b>If the DMQ does not exist the message is deleted
      * even when it is eligible</b>, which is why this provisions it.
      *
-     * <p>One shared queue rather than a DMQ per endpoint. Temporary reply queues cannot be given
-     * their own {@code deadMsgQueue} — they are not SEMP-configurable objects — while every
-     * queue already points at {@code #DEAD_MSG_QUEUE} by default. So this needs no SEMP access
-     * and behaves identically for temporary and durable reply endpoints. Dead-lettered messages
-     * keep their original topic, so requests and replies remain easy to tell apart on inspection.
+     * <p>One shared queue rather than a DMQ per endpoint. Every queue already points at
+     * {@code #DEAD_MSG_QUEUE} by default, so this needs no management access; naming a different
+     * DMQ per endpoint would mean setting {@code deadMsgQueue} on each source queue over SEMP.
+     * Dead-lettered messages keep their original topic, so requests and replies remain easy to
+     * tell apart on inspection.
      */
     public static class Dmq {
         /** Mark messages eligible and provision the queue. */
@@ -341,19 +266,4 @@ public class SolaceRequestReplyProperties {
         public void setQuotaMb(int v) { this.quotaMb = v; }
     }
 
-    public static class Semp {
-        private String url;
-        private String username;
-        private String password;
-        private String msgVpn = "default";
-
-        public String getUrl() { return url; }
-        public void setUrl(String v) { this.url = v; }
-        public String getUsername() { return username; }
-        public void setUsername(String v) { this.username = v; }
-        public String getPassword() { return password; }
-        public void setPassword(String v) { this.password = v; }
-        public String getMsgVpn() { return msgVpn; }
-        public void setMsgVpn(String v) { this.msgVpn = v; }
-    }
 }

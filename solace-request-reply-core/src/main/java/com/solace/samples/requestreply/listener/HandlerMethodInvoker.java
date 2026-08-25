@@ -47,9 +47,6 @@ public class HandlerMethodInvoker {
         Map<String, Object> headers = new HashMap<>(request.getHeaders());
         headers.put(SolaceHeaders.CORRELATION_ID, request.getCorrelationId());
         if (request.getReplyTo() != null) { headers.put(SolaceHeaders.REPLY_TO, request.getReplyTo()); }
-        if (request.getPartitionKey() != null) {
-            headers.put(SolaceHeaders.PARTITION_KEY, request.getPartitionKey());
-        }
         if (request.getSequence() != null) { headers.put(SolaceHeaders.SEQUENCE, request.getSequence()); }
         headers.put("solace_rawMessage", request);
         byte[] payload = request.getPayload() == null ? new byte[0] : request.getPayload();
