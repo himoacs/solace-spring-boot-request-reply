@@ -71,7 +71,7 @@ public class DiagnosticsController {
             reply.put("established", replyEndpoint.isEstablished());
             reply.put("queue", replyEndpoint.isEstablished() ? replyEndpoint.queue().getName() : null);
             reply.put("subscription", replyEndpoint.subscription());
-            reply.put("replyToTemplate", template == null ? null : template.replyTopic());
+            reply.put("replyToTemplate", template == null ? null : template.replyTopicPattern());
             reply.put("perRequestPlaceholders", props.getReply().getPerRequestPlaceholders());
         }
         out.put("replyEndpoint", reply);

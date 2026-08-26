@@ -36,7 +36,6 @@ solace:
   request-reply:
     request:
       timeout: 5s
-      delivery-mode: PERSISTENT
       # Without this a queued request can outlive the requestor's patience and be acted on
       # after nobody is waiting — a reservation the customer never sees confirmed.
       ttl-matches-timeout: true

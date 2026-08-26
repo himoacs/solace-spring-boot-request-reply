@@ -16,11 +16,9 @@ import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
-import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
-import java.time.Duration;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.concurrent.ExecutionException;
@@ -58,24 +56,10 @@ public class BookingController {
 
     @PostMapping
     public ResponseEntity<Map<String, Object>> book(@Valid @RequestBody BookingRequest request) {
-        return execute(request, null);
+        return execute(request);
     }
 
-    /**
-     * Replays a booking under a caller-supplied correlation id.
-     *
-     * <p>This is the double-booking guard, made testable. Guaranteed delivery is at-least-once, so
-     * a replier that reserves a seat and dies before acknowledging will see the same request again.
-     * Posting the same id twice must produce <b>one</b> reservation and a second reply flagged
-     * {@code replayed}. Without an endpoint like this the property is asserted rather than shown.
-     */
-    @PostMapping("/replay")
-    public ResponseEntity<Map<String, Object>> replay(@Valid @RequestBody BookingRequest request,
-                                                      @RequestParam String correlationId) {
-        return execute(request, correlationId);
-    }
-
-    private ResponseEntity<Map<String, Object>> execute(BookingRequest request, String correlationId) {
+    private ResponseEntity<Map<String, Object>> execute(BookingRequest request) {
         ReplyingSolaceTemplate template = templateProvider.getIfAvailable();
         if (template == null) {
             Map<String, Object> body = new LinkedHashMap<>();
@@ -92,8 +76,7 @@ public class BookingController {
 
         long start = System.nanoTime();
         RequestReplyFuture<SeatReservation> future = template.sendAndReceive(
-                topic, request, SeatReservation.class,
-                template.defaultReplyTimeout(), correlationId);
+                topic, request, SeatReservation.class, template.defaultReplyTimeout());
 
         // Stage one: did the broker accept and spool the request?
         long confirmNanos;
@@ -123,7 +106,7 @@ public class BookingController {
                     "publishConfirmMicros", confirmNanos / 1_000));
             body.put("requestTopic", topic);
             body.put("inventoryRow", request.inventoryRow());
-            body.put("replyTopic", template.replyTopic());
+            body.put("replyTopicPattern", template.replyTopicPattern());
             return ResponseEntity.ok(body);
 
         } catch (ExecutionException e) {

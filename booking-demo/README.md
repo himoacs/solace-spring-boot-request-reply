@@ -21,10 +21,9 @@ For the library's design and configuration reference, see the [root README](../R
 | [4](#step-4-read-the-reply-topic) | Per-request topic placeholders — the train number appears in the reply topic |
 | [5](#step-5-ask-what-was-actually-provisioned) | What the library actually provisioned, versus what you configured |
 | [6–7](#step-6-the-two-stage-future-publish-versus-reply) | The two-stage future: telling a publish failure apart from an unanswered request |
-| [8](#step-8-the-double-booking-guard) | The double-booking guard under at-least-once delivery |
-| [9](#step-9-nothing-is-lost-when-a-request-expires) | Dead-lettering: an expired request kept for inspection instead of deleted |
-| [10–11](#step-10-split-the-two-sides-into-separate-processes) | Splitting requestor and replier, then scaling repliers out |
-| [12](#step-12-measure-latency) | Exact latency percentiles with a segment breakdown |
+| [8](#step-8-nothing-is-lost-when-a-request-expires) | Dead-lettering: an expired request kept for inspection instead of deleted |
+| [9–10](#step-9-split-the-two-sides-into-separate-processes) | Splitting requestor and replier, then scaling repliers out |
+| [11](#step-11-measure-latency) | Exact latency percentiles with a segment breakdown |
 
 
 ## How the pieces fit together
@@ -135,7 +134,7 @@ curl -s -X POST http://localhost:8091/api/bookings \
   "latency": { "totalMicros": 60194, "publishConfirmMicros": 13104 },
   "requestTopic": "cris/booking/seatReserve/request/v1/nr/12951",
   "inventoryRow": "12951-2026-09-15-3a",
-  "replyTopic": "cris/booking/seatReserve/reply/v1/nr/unknown/<host>"
+  "replyTopicPattern": "cris/booking/seatReserve/reply/v1/nr/*/<host>"
 }
 ```
 
@@ -151,8 +150,9 @@ Three fields are worth reading:
 - **`inventoryRow`** is `train-date-class` — the seats two simultaneous bookings actually compete
   for, and the key the replier locks on. Not the request id, of which there is one per caller and
   which would therefore protect nothing.
-- **`replyTopic`** shows `unknown` in the train-number position because this is the *template*.
-  The concrete per-request value is in step 4.
+- **`replyTopicPattern`** is the reply-to *template*, with `*` where the train number goes. That
+  level is only known once there is a request to derive it from, so here it is the wildcard the
+  subscription actually uses. The concrete per-request value is in step 4.
 
 ---
 
@@ -332,56 +332,14 @@ HTTP statuses, three distinct causes.
 
 ---
 
-## Step 8: The double-booking guard
-
-Guaranteed messaging is **at-least-once, not exactly-once**. On a non-exclusive queue, an
-unacknowledged message is redelivered to another consumer. A replier that reserves a seat and then
-dies before acknowledging will see the same request again — and a naive handler reserves a second
-seat.
-
-`POST /api/bookings/replay` sends a request under a correlation id you choose, which is how you
-reproduce a redelivery on demand.
-
-```bash
-CID="demo-$(date +%s)"
-BODY='{"zone":"nr","trainNo":"12951","journeyDate":"2026-09-15",
-       "seatClass":"AC3","passengerName":"R Iyer","passengers":1}'
-
-curl -s -X POST "http://localhost:8091/api/bookings/replay?correlationId=$CID" \
-  -H 'Content-Type: application/json' -d "$BODY" | jq '.reservation'
-
-curl -s -X POST "http://localhost:8091/api/bookings/replay?correlationId=$CID" \
-  -H 'Content-Type: application/json' -d "$BODY" | jq '.reservation'
-```
-
-```json
-{ "pnr": "0841866638", "status": "CONFIRMED", "coach": "B3", "berths": "3", "replayed": false }
-{ "pnr": "0841866638", "status": "CONFIRMED", "coach": "B3", "berths": "3", "replayed": true }
-```
-
-**Same PNR, same berth, `replayed: true`.** One seat was reserved, and the second delivery returned
-the original answer instead of doing the work again.
-
-Two mechanisms produce that, both in [SeatInventoryService.java](src/main/java/com/solace/samples/booking/replier/SeatInventoryService.java):
-
-1. **Idempotent handling.** The correlation id is recorded *with* the reservation, and a repeat
-   returns the stored reply. Here that is a `ConcurrentHashMap`; in a real service the reservation and
-   that record are one database transaction under a unique constraint.
-2. **Acknowledge last.** The replier processes the request, publishes the reply, waits for the broker
-   to confirm the reply is spooled, and only then acknowledges the request (`ackMode = "CLIENT"`).
-   Acknowledging first would mean a crash in between loses the request after the work was already
-   done — the seat taken, the customer told it failed, and nothing left to redeliver.
-
----
-
-## Step 9: Nothing is lost when a request expires
+## Step 8: Nothing is lost when a request expires
 
 Guaranteed delivery keeps a request safe right up to the point the broker gives up on it. When a
 request exhausts its redeliveries, or its TTL expires, the broker's choice is to **delete** it or to
 move it to a dead message queue. Deleting means a booking vanishes with nothing anywhere recording
 that it existed, so the demo enables dead-lettering.
 
-You need a request that nobody consumes — so start the demo with the replier switched off. (Step 10
+You need a request that nobody consumes — so start the demo with the replier switched off. (Step 9
 covers the profiles properly; here it is just a way to leave the request queue unattended.)
 
 ```bash
@@ -469,7 +427,7 @@ still be inert: a DMQ that could not be created means the broker goes back to de
 
 ---
 
-## Step 10: Split the two sides into separate processes
+## Step 9: Split the two sides into separate processes
 
 Nothing about the demo requires both sides in one JVM. They are independent beans over separate
 queues, so splitting them needs no code change — only profiles.
@@ -535,7 +493,7 @@ holds the waiting future, because the reply topic names that instance.
 
 ---
 
-## Step 11: Scale the repliers out
+## Step 10: Scale the repliers out
 
 Add a second replier against the same queue:
 
@@ -560,7 +518,7 @@ work the moment its flow bound.
 
 ---
 
-## Step 12: Measure latency
+## Step 11: Measure latency
 
 One command runs a test, prints a report, and exits. No metrics backend required.
 
@@ -642,9 +600,10 @@ docker compose -f ../docker/docker-compose.yml down -v
 
 ## How the demo uses the core library
 
-The demo depends only on `solace-request-reply-core`. There is **no** `@EnableSolaceRequestReply` and
-no manual bean wiring: the library ships a Spring Boot auto-configuration, so adding the dependency
-and setting `solace.request-reply.*` properties is the whole integration.
+The demo depends only on `solace-request-reply-core`, and does no bean wiring of its own. The
+library ships a Spring Boot auto-configuration, so adding the dependency and setting
+`solace.request-reply.*` properties is the whole integration — there is no `@Enable…` annotation to
+remember.
 
 The entire surface used by this demo is four things:
 
