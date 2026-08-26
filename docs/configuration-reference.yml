@@ -280,8 +280,8 @@ solace:
 # ---------------------------------------------------------------------------
 booking:
   topics:
-    request-pattern: "cris/booking/seatReserve/request/v1/{zone}/{trainNo}"
-    request-subscription: "cris/booking/seatReserve/request/v1/>"
+    request-pattern: "rail/booking/seatReserve/request/v1/{zone}/{trainNo}"
+    request-subscription: "rail/booking/seatReserve/request/v1/>"
 
 # Used by the standalone latency test, under --spring.profiles.active=loadtest.
 loadtest:

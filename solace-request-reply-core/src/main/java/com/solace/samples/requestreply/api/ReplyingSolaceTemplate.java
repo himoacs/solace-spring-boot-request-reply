@@ -61,8 +61,8 @@ public interface ReplyingSolaceTemplate {
      * them from, so here they appear as the wildcard the subscription actually uses:
      *
      * <pre>
-     * template   cris/booking/seatReserve/reply/v1/nr/&#42;/booking-1
-     * a request  cris/booking/seatReserve/reply/v1/nr/12951/booking-1
+     * template   rail/booking/seatReserve/reply/v1/nr/&#42;/booking-1
+     * a request  rail/booking/seatReserve/reply/v1/nr/12951/booking-1
      * </pre>
      */
     String replyTopicPattern();

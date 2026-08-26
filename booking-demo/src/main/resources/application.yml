@@ -49,7 +49,7 @@ solace:
       # Reply queues are durable: the subscription is a broker-side object that survives a
       # reconnect on its own, and the queue keeps spooling replies while this instance is
       # disconnected rather than discarding them.
-      topic-pattern: "cris/booking/seatReserve/reply/v1/{zone}/{trainNo}/{instanceId}"
+      topic-pattern: "rail/booking/seatReserve/reply/v1/{zone}/{trainNo}/{instanceId}"
       # trainNo is filled in per request and wildcarded in the subscription, so one
       # subscription covers every train while the topic still names the one in play.
       per-request-placeholders:
@@ -60,7 +60,7 @@ solace:
         trainNo: "trainNo()"
       placeholders:
         zone: nr
-      queue-name-pattern: "q.cris.booking.reply.{instanceId}"
+      queue-name-pattern: "q.rail.booking.reply.{instanceId}"
       # instance-id defaults to the hostname, which is the pod name on Kubernetes. It must be
       # unique per instance and stable across restarts: the reply queue is durable and
       # exclusive, so two instances sharing an id bind the same queue and the second silently
@@ -70,9 +70,9 @@ solace:
       quota-mb: 100
 
     replier:
-      queue: q.cris.booking.seatReserve
+      queue: q.rail.booking.seatReserve
       topics:
-        - "cris/booking/seatReserve/request/v1/>"
+        - "rail/booking/seatReserve/request/v1/>"
       dmq-eligible: true
       # Unset means "follow request.timeout", which is what you want: a reply is worthless once
       # the requestor's future has given up, and a fixed value here would expire replies while
@@ -103,8 +103,8 @@ solace:
 
 booking:
   topics:
-    request-pattern: "cris/booking/seatReserve/request/v1/{zone}/{trainNo}"
-    request-subscription: "cris/booking/seatReserve/request/v1/>"
+    request-pattern: "rail/booking/seatReserve/request/v1/{zone}/{trainNo}"
+    request-subscription: "rail/booking/seatReserve/request/v1/>"
 
 management:
   endpoints:

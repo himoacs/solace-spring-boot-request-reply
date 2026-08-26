@@ -14,8 +14,8 @@ import java.lang.annotation.Target;
  * same default Spring Kafka uses.
  *
  * <pre>{@code
- * @SolaceListener(queue = "q.cris.booking.seatReserve",
- *                 topics = "cris/booking/seatReserve/request/v1/>",
+ * @SolaceListener(queue = "q.rail.booking.seatReserve",
+ *                 topics = "rail/booking/seatReserve/request/v1/>",
  *                 concurrency = "10")
  * @SendTo
  * public SeatReservation reserve(@Payload BookingRequest req,

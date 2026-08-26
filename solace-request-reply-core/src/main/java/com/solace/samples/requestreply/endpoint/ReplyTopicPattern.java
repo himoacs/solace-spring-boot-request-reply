@@ -16,11 +16,11 @@ import java.util.regex.Pattern;
  * {@code *} in the subscription, so one subscription covers every value.
  *
  * <pre>
- * pattern       cris/booking/seatReserve/reply/v1/{zone}/{trainNo}/{instanceId}
+ * pattern       rail/booking/seatReserve/reply/v1/{zone}/{trainNo}/{instanceId}
  * per-request   [trainNo]
  *
- * subscription  cris/booking/seatReserve/reply/v1/nr/&#42;/client-0-a3f9
- * reply-to      cris/booking/seatReserve/reply/v1/nr/12951/client-0-a3f9
+ * subscription  rail/booking/seatReserve/reply/v1/nr/&#42;/client-0-a3f9
+ * reply-to      rail/booking/seatReserve/reply/v1/nr/12951/client-0-a3f9
  * </pre>
  *
  * <p>This is what lets request-derived levels ride along on the reply topic without coupling

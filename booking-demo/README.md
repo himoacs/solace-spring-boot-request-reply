@@ -81,20 +81,20 @@ library does before a single message is sent:
 
 ```
 SolaceSession         : Solace session connected: host=tcp://localhost:55565 vpn=default
-ReplyEndpointFactory  : Reply endpoint identity: instanceId=<host> queue=q.cris.booking.reply.<host>
+ReplyEndpointFactory  : Reply endpoint identity: instanceId=<host> queue=q.rail.booking.reply.<host>
 PersistentPublisher   : Publisher started, deliveryMode=PERSISTENT
-DurableReplyEndpoint  : Reply endpoint ready: queue=q.cris.booking.reply.<host>
-                        subscription=cris/booking/seatReserve/reply/v1/nr/*/<host>
-FlowConsumer          : Flow 'reply' bound to queue 'q.cris.booking.reply.<host>' (ackMode=AUTO)
+DurableReplyEndpoint  : Reply endpoint ready: queue=q.rail.booking.reply.<host>
+                        subscription=rail/booking/seatReserve/reply/v1/nr/*/<host>
+FlowConsumer          : Flow 'reply' bound to queue 'q.rail.booking.reply.<host>' (ackMode=AUTO)
 DmqProvisioner        : Dead message queue '#DEAD_MSG_QUEUE' provisioned/verified: quota=1000MB
                         respectsTtl=false
-RequestQueueProvisioner : Request queue 'q.cris.booking.seatReserve' provisioned/verified:
+RequestQueueProvisioner : Request queue 'q.rail.booking.seatReserve' provisioned/verified:
                         accessType=NON_EXCLUSIVE quota=2000MB maxRedelivery=3 respectsTtl=true
-RequestQueueProvisioner : Mapped topic 'cris/booking/seatReserve/request/v1/>' onto queue
-FlowConsumer          : Flow 'seatReserve-0' bound to queue 'q.cris...' (ackMode=CLIENT)
+RequestQueueProvisioner : Mapped topic 'rail/booking/seatReserve/request/v1/>' onto queue
+FlowConsumer          : Flow 'seatReserve-0' bound to queue 'q.rail...' (ackMode=CLIENT)
 FlowConsumer          : Flow 'seatReserve-1' ...  (four flows: concurrency=4)
-SolaceMessageListenerContainer : Listener 'seatReserve' started: queue=q.cris.booking.seatReserve
-                        concurrency=4 topics=[cris/booking/seatReserve/request/v1/>]
+SolaceMessageListenerContainer : Listener 'seatReserve' started: queue=q.rail.booking.seatReserve
+                        concurrency=4 topics=[rail/booking/seatReserve/request/v1/>]
 Started BookingDemoApplication in 1.706 seconds
 ```
 
@@ -132,9 +132,9 @@ curl -s -X POST http://localhost:8091/api/bookings \
     "berths": "1,2", "trainNo": "12951", "replayed": false
   },
   "latency": { "totalMicros": 60194, "publishConfirmMicros": 13104 },
-  "requestTopic": "cris/booking/seatReserve/request/v1/nr/12951",
+  "requestTopic": "rail/booking/seatReserve/request/v1/nr/12951",
   "inventoryRow": "12951-2026-09-15-3a",
-  "replyTopicPattern": "cris/booking/seatReserve/reply/v1/nr/*/<host>"
+  "replyTopicPattern": "rail/booking/seatReserve/reply/v1/nr/*/<host>"
 }
 ```
 
@@ -162,14 +162,14 @@ Look at the application log for the request you just sent:
 
 ```
 SeatReservationListener : A Sharma train=12951 class=3a -> PNR 0841866636 CONFIRMED |
-    replyTo=cris/booking/seatReserve/reply/v1/nr/12951/<host>
+    replyTo=rail/booking/seatReserve/reply/v1/nr/12951/<host>
 ```
 
 Compare the two topics:
 
 ```
-subscription   cris/booking/seatReserve/reply/v1/nr/*/<host>
-reply-to       cris/booking/seatReserve/reply/v1/nr/12951/<host>
+subscription   rail/booking/seatReserve/reply/v1/nr/*/<host>
+reply-to       rail/booking/seatReserve/reply/v1/nr/12951/<host>
 ```
 
 The requestor subscribes **once**, with a wildcard in the train-number position, and builds a
@@ -185,7 +185,7 @@ The reply topic pattern holds three kinds of placeholder, and they resolve at di
 
 ```yaml
 reply:
-  topic-pattern: "cris/booking/seatReserve/reply/v1/{zone}/{trainNo}/{instanceId}"
+  topic-pattern: "rail/booking/seatReserve/reply/v1/{zone}/{trainNo}/{instanceId}"
   placeholders:
     zone: nr                       # static
   per-request-placeholders:
@@ -241,12 +241,12 @@ curl -s http://localhost:8091/api/diagnostics/endpoints | jq
   "session":  { "connected": true, "lastEvent": "CONNECTED", "reconnects": 0 },
   "replyEndpoint": {
     "established": true,
-    "queue": "q.cris.booking.reply.<host>",
-    "subscription": "cris/booking/seatReserve/reply/v1/nr/*/<host>",
+    "queue": "q.rail.booking.reply.<host>",
+    "subscription": "rail/booking/seatReserve/reply/v1/nr/*/<host>",
     "perRequestPlaceholders": ["trainNo"]
   },
   "requestQueue": {
-    "queue": "q.cris.booking.seatReserve", "accessType": "NON_EXCLUSIVE",
+    "queue": "q.rail.booking.seatReserve", "accessType": "NON_EXCLUSIVE",
     "concurrency": 4, "provisionMode": "CREATE_IF_MISSING",
     "maxRedelivery": 3, "respectsTtl": true
   },
@@ -289,7 +289,7 @@ curl -s -X POST http://localhost:8091/api/bookings \
 {
   "error": "reply-timeout",
   "detail": "The request was spooled but no replier answered in time",
-  "requestTopic": "cris/booking/seatReserve/request/v1/nr/12951",
+  "requestTopic": "rail/booking/seatReserve/request/v1/nr/12951",
   "publishConfirmed": true,
   "publishConfirmMicros": 9981
 }
@@ -387,7 +387,7 @@ The request queue is now empty: the message was **moved**, not copied.
 
 ```bash
 curl -s -u admin:admin \
-  'http://localhost:8085/SEMP/v2/monitor/msgVpns/default/queues/q.cris.booking.seatReserve/msgs' \
+  'http://localhost:8085/SEMP/v2/monitor/msgVpns/default/queues/q.rail.booking.seatReserve/msgs' \
   | jq '.data | length'      # 0
 ```
 
@@ -485,7 +485,7 @@ And in the **replier's** log, on port 8092:
 
 ```
 SeatReservationListener : S Nair train=12621 class=2a -> PNR 0571124365 CONFIRMED |
-    replyTo=cris/booking/seatReserve/reply/v1/nr/12621/requestor-1
+    replyTo=rail/booking/seatReserve/reply/v1/nr/12621/requestor-1
 ```
 
 Two processes, one round trip. The reply found its way back to the specific requestor JVM whose heap
@@ -626,8 +626,8 @@ RequestReplyFuture<SeatReservation> f = template.sendAndReceive(
         topic, request, SeatReservation.class);
 
 // Replier
-@SolaceListener(queue = "q.cris.booking.seatReserve",
-                topics = "cris/booking/seatReserve/request/v1/>",
+@SolaceListener(queue = "q.rail.booking.seatReserve",
+                topics = "rail/booking/seatReserve/request/v1/>",
                 concurrency = "4", ackMode = "CLIENT")
 @SendTo
 public SeatReservation reserve(@Payload BookingRequest req,
