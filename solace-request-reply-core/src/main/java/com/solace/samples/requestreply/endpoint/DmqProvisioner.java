@@ -17,10 +17,16 @@ import org.slf4j.LoggerFactory;
  * of enabling dead-lettering, not a separate operational step.
  *
  * <p>Plain JCSMP, no SEMP. {@code #DEAD_MSG_QUEUE} is an ordinary durable queue despite the
- * reserved-looking name, and JCSMP provisions it like any other — verified against a live
- * broker. That is what keeps this working for temporary reply endpoints too: every queue points
- * at the Message VPN's default DMQ already, so nothing has to set {@code deadMsgQueue} per
- * endpoint, which is the one part SEMP would have been needed for.
+ * reserved-looking name, and JCSMP provisions it like any other — verified against a live broker.
+ *
+ * <h2>Provisioning is not routing</h2>
+ * This class creates the queue. It cannot decide which queue a message dead-letters <em>into</em>:
+ * that is {@code deadMsgQueue} on the <em>source</em> queue, and {@code EndpointProperties} has no
+ * setter for it — JCSMP cannot express it at all. Every queue points at the Message VPN's default,
+ * {@code #DEAD_MSG_QUEUE}, which is why that default needs no management access and works out of
+ * the box. Naming a different queue here provisions and reports that queue, but nothing routes to
+ * it until {@code deadMsgQueue} is set on each source queue over SEMP, the CLI or your
+ * configuration-management tool, which is why doing so logs a warning.
  *
  * <h2>Why failure here is not fatal</h2>
  * Dead-lettering is on by default, so a broker that refuses this — a restricted client profile,
@@ -31,6 +37,9 @@ import org.slf4j.LoggerFactory;
 public class DmqProvisioner {
 
     private static final Logger log = LoggerFactory.getLogger(DmqProvisioner.class);
+
+    /** The Message VPN default every queue's {@code deadMsgQueue} already points at. */
+    static final String DEFAULT_NAME = "#DEAD_MSG_QUEUE";
 
     private final SolaceSession session;
     private final SolaceRequestReplyProperties.Dmq cfg;
@@ -84,6 +93,7 @@ public class DmqProvisioner {
             detail = "provisioned/verified";
             log.info("Dead message queue '{}' provisioned/verified: quota={}MB respectsTtl=false",
                     cfg.getName(), cfg.getQuotaMb());
+            warnIfNotTheVpnDefault();
 
         } catch (Exception e) {
             established = false;
@@ -95,6 +105,24 @@ public class DmqProvisioner {
                             + "to stop trying.",
                     cfg.getName(), rootMessage(e));
         }
+    }
+
+    /**
+     * A non-default name creates the queue but routes nothing to it, and the difference is
+     * invisible: provisioning succeeds, diagnostics report {@code established: true}, and dead
+     * messages keep going to the VPN default. Only a warning can close that gap, because the
+     * setting that would close it is not reachable from JCSMP.
+     */
+    private void warnIfNotTheVpnDefault() {
+        if (DEFAULT_NAME.equals(cfg.getName())) { return; }
+        detail = "provisioned/verified; routing NOT configured by this library";
+        log.warn("Dead message queue '{}' is not the Message VPN default '{}'. It has been "
+                        + "created, but nothing dead-letters into it: the queue a message goes to "
+                        + "is 'deadMsgQueue' on the SOURCE queue, which JCSMP cannot set. Until you "
+                        + "set it over SEMP or the CLI, dead messages still go to '{}'. For example: "
+                        + "PATCH /SEMP/v2/config/msgVpns/<vpn>/queues/<queue> with "
+                        + "{\"deadMsgQueue\":\"{}\"}",
+                cfg.getName(), DEFAULT_NAME, DEFAULT_NAME, cfg.getName());
     }
 
     private static String rootMessage(Throwable t) {

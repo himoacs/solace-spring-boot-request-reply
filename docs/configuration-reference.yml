@@ -57,15 +57,16 @@ solace:
     enabled: true
 
     # ------------------------------------------------------------ the requestor
+    #
+    # Everything is published PERSISTENT. There is no delivery-mode switch: direct
+    # messages are never acknowledged by the broker, so the publish confirmation
+    # this library reports would never arrive, and the replier -- which acknowledges
+    # a request only once its reply is confirmed spooled -- would never acknowledge
+    # anything. Both guarantees this design exists for depend on guaranteed messaging.
     request:
 
       # Default deadline when a caller does not pass one to sendAndReceive.
       timeout: 5s
-
-      # PERSISTENT or DIRECT. PERSISTENT is the point of this design: the request
-      # is spooled by the broker and survives a replier restart. DIRECT is faster
-      # but a request is lost if no replier is connected.
-      delivery-mode: PERSISTENT
 
       # Sets the message TTL equal to the timeout above. Recommended. Without it
       # a request can sit in the queue longer than the requestor is willing to
@@ -153,6 +154,19 @@ solace:
       # Spool quota for the reply queue, in MB.
       quota-mb: 100
 
+      # How the reply queue is provisioned. Same two modes as
+      # replier.provision.mode, same meaning: CREATE_IF_MISSING creates it if
+      # absent and fails on drift; OFF assumes it exists and only subscribes.
+      #
+      # On a message VPN whose client profile forbids creating endpoints, the
+      # replier already had this escape hatch and the requestor did not,
+      # simply failing to start. Because the reply queue is named per
+      # instance rather than shared, using OFF here means provisioning one
+      # queue per instance identity out of band in advance -- practical when
+      # identities are known ahead of time, such as a StatefulSet's stable
+      # ordinals.
+      provision-mode: CREATE_IF_MISSING          # OFF | CREATE_IF_MISSING
+
     # -------------------------------------------------------------- the replier
     replier:
 
@@ -193,10 +207,15 @@ solace:
       provision:
         # CREATE_IF_MISSING creates the queue when absent and fails startup if an
         # existing queue's properties differ. Safe to leave enabled, because
-        # drift is reported rather than ignored.
-        # VALIDATE never creates, and fails if the queue is missing or drifted.
+        # drift is reported rather than ignored, whether or not creation was
+        # needed.
         # OFF assumes the queue exists and checks nothing.
-        mode: CREATE_IF_MISSING          # OFF | VALIDATE | CREATE_IF_MISSING
+        #
+        # Two modes, not three: JCSMP's provision() creates a missing endpoint
+        # unconditionally, so there is no flag that means "validate but never
+        # create" -- offering one honestly would need an existence probe before
+        # ever calling provision(), which this library does not carry.
+        mode: CREATE_IF_MISSING          # OFF | CREATE_IF_MISSING
 
         quota-mb: 5000
 
@@ -225,12 +244,24 @@ solace:
       # application down. The cost of failing is the old behaviour -- discard.
       enabled: true
 
-      # One shared queue rather than a DMQ per endpoint. #DEAD_MSG_QUEUE is the
-      # Message VPN default that every queue already points at, so this needs no
-      # management access at all. Naming anything else would additionally require
-      # setting deadMsgQueue on each source queue over SEMP. Dead-lettered
-      # messages keep their original topic, so requests and replies remain easy
-      # to tell apart on inspection.
+      # The queue to provision and report. One shared queue rather than one per
+      # endpoint: #DEAD_MSG_QUEUE is the Message VPN default that every queue's
+      # deadMsgQueue already points at, so this needs no management access at all,
+      # and dead-lettered messages keep their original topic -- requests and
+      # replies stay easy to tell apart on inspection.
+      #
+      # NAMING ANYTHING ELSE PROVISIONS THAT QUEUE BUT DOES NOT ROUTE TO IT. The
+      # queue a message dead-letters into is deadMsgQueue on the SOURCE queue, and
+      # JCSMP cannot set it -- EndpointProperties has no such property. Set it on
+      # the request queue and on every reply queue yourself, then point this at the
+      # same name so provisioning and diagnostics agree:
+      #
+      #   curl -u admin:admin -X PATCH \
+      #     '.../SEMP/v2/config/msgVpns/default/queues/q.my.service.requests' \
+      #     -H 'Content-Type: application/json' \
+      #     -d '{"deadMsgQueue":"q.my.service.dmq"}'
+      #
+      # A non-default name here is logged as a warning at startup.
       name: "#DEAD_MSG_QUEUE"
 
       # Create it at startup when missing. Turn off if it is provisioned out of

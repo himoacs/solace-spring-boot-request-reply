@@ -22,6 +22,7 @@ import com.solacesystems.jcsmp.JCSMPSession;
 import com.solacesystems.jcsmp.SpringJCSMPFactory;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.BeanFactory;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.boot.autoconfigure.AutoConfiguration;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnClass;
@@ -45,7 +46,14 @@ import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
- * Wires the library. Every bean is {@code @ConditionalOnMissingBean} so any piece can be replaced.
+ * Wires the library. Every bean is {@code @ConditionalOnMissingBean} so any piece can be replaced,
+ * except {@link SolaceListenerAnnotationBeanPostProcessor}, which has to be registered as a static
+ * bean before regular bean instantiation begins.
+ *
+ * <p>This is the only entry point. There is deliberately no {@code @EnableSolaceRequestReply}
+ * counterpart to {@code @EnableKafka}: the post-processor it would import is useless without the
+ * session, provisioner and publisher defined here, so importing it alone produced a half-built
+ * context rather than an alternative to auto-configuration.
  */
 @AutoConfiguration
 @ConditionalOnClass(JCSMPSession.class)
@@ -98,9 +106,8 @@ public class SolaceRequestReplyAutoConfiguration {
 
     @Bean(destroyMethod = "close")
     @ConditionalOnMissingBean
-    public PersistentPublisher persistentPublisher(SolaceSession session,
-                                                   SolaceRequestReplyProperties props) {
-        return new PersistentPublisher(session, props.getRequest().getDeliveryMode());
+    public PersistentPublisher persistentPublisher(SolaceSession session) {
+        return new PersistentPublisher(session);
     }
 
     @Bean
@@ -134,13 +141,6 @@ public class SolaceRequestReplyAutoConfiguration {
         return Executors.newFixedThreadPool(4, named("rr-complete-"));
     }
 
-    @Bean(name = "solaceHandlerExecutor", destroyMethod = "shutdown")
-    @ConditionalOnMissingBean(name = "solaceHandlerExecutor")
-    public ExecutorService solaceHandlerExecutor(SolaceRequestReplyProperties props) {
-        int n = Math.max(1, props.getReplier().getConcurrency());
-        return Executors.newFixedThreadPool(n, named("rr-handler-"));
-    }
-
     @Bean(destroyMethod = "close")
     @ConditionalOnMissingBean
     @ConditionalOnProperty(prefix = "solace.request-reply.reply", name = "enabled",
@@ -168,6 +168,19 @@ public class SolaceRequestReplyAutoConfiguration {
     public ReplyPathHealthIndicator solaceReplyPathHealthIndicator(
             SolaceSession session, ReplyEndpoint replyEndpoint) {
         return new ReplyPathHealthIndicator(session, replyEndpoint);
+    }
+
+    /**
+     * Unconditional, unlike {@link #solaceReplyPathHealthIndicator}: a replier-only process has
+     * no reply path to report on, and was otherwise left with no Solace health signal at all.
+     */
+    @Bean
+    @ConditionalOnMissingBean(name = "solaceSessionHealthIndicator")
+    @ConditionalOnClass(name = "org.springframework.boot.actuate.health.HealthIndicator")
+    public SolaceSessionHealthIndicator solaceSessionHealthIndicator(
+            SolaceSession session, SolaceListenerRegistrar registrar,
+            SolaceListenerAnnotationBeanPostProcessor postProcessor) {
+        return new SolaceSessionHealthIndicator(session, registrar, postProcessor);
     }
 
 
@@ -225,15 +238,15 @@ public class SolaceRequestReplyAutoConfiguration {
      * handler depends on exist.
      */
     @Bean
+    @ConditionalOnMissingBean
     public SolaceListenerRegistrar solaceListenerRegistrar(
             SolaceListenerAnnotationBeanPostProcessor postProcessor,
             SolaceSession session, RequestQueueProvisioner provisioner,
             PersistentPublisher publisher, PayloadCodec codec, HandlerMethodInvoker invoker,
-            ExecutorService solaceHandlerExecutor,
             ObjectProvider<SolaceListenerErrorHandler> errorHandlers,
-            SolaceRequestReplyProperties props) {
+            BeanFactory beanFactory, SolaceRequestReplyProperties props) {
         return new SolaceListenerRegistrar(postProcessor, session, provisioner, publisher, codec,
-                invoker, solaceHandlerExecutor, errorHandlers, props);
+                invoker, errorHandlers, beanFactory, props);
     }
 
     private static ThreadFactory named(String prefix) {
@@ -255,25 +268,25 @@ public class SolaceRequestReplyAutoConfiguration {
         private final PersistentPublisher publisher;
         private final PayloadCodec codec;
         private final HandlerMethodInvoker invoker;
-        private final ExecutorService handlerExecutor;
         private final ObjectProvider<SolaceListenerErrorHandler> errorHandlers;
+        private final BeanFactory beanFactory;
         private final SolaceRequestReplyProperties props;
         private final List<SolaceMessageListenerContainer> containers = new ArrayList<>();
 
         SolaceListenerRegistrar(SolaceListenerAnnotationBeanPostProcessor postProcessor,
                                 SolaceSession session, RequestQueueProvisioner provisioner,
                                 PersistentPublisher publisher, PayloadCodec codec,
-                                HandlerMethodInvoker invoker, ExecutorService handlerExecutor,
+                                HandlerMethodInvoker invoker,
                                 ObjectProvider<SolaceListenerErrorHandler> errorHandlers,
-                                SolaceRequestReplyProperties props) {
+                                BeanFactory beanFactory, SolaceRequestReplyProperties props) {
             this.postProcessor = postProcessor;
             this.session = session;
             this.provisioner = provisioner;
             this.publisher = publisher;
             this.codec = codec;
             this.invoker = invoker;
-            this.handlerExecutor = handlerExecutor;
             this.errorHandlers = errorHandlers;
+            this.beanFactory = beanFactory;
             this.props = props;
         }
 
@@ -282,9 +295,12 @@ public class SolaceRequestReplyAutoConfiguration {
             if (!containers.isEmpty()) { return; }
             publisher.start();
             for (SolaceListenerEndpoint endpoint : postProcessor.endpoints()) {
+                // Each container owns its own handler pool, sized from this endpoint's own
+                // concurrency — see SolaceMessageListenerContainer's class javadoc for why one
+                // process-wide pool was removed rather than kept alongside this.
                 SolaceMessageListenerContainer container = new SolaceMessageListenerContainer(
                         endpoint, session, provisioner, publisher, codec, invoker,
-                        errorHandlers.getIfAvailable(), handlerExecutor,
+                        resolveErrorHandler(endpoint),
                         props.getDmq().isEnabled() && props.getReplier().isDmqEligible(),
                         props.getReplier().resolveReplyTtlMillis(props.getRequest().getTimeout()));
                 container.start();
@@ -293,6 +309,30 @@ public class SolaceRequestReplyAutoConfiguration {
             if (!containers.isEmpty()) {
                 log.info("Started {} Solace listener container(s)", containers.size());
             }
+        }
+
+        /**
+         * The handler named by {@code @SolaceListener(errorHandler = "...")}, or the single
+         * {@link SolaceListenerErrorHandler} bean if the listener names none.
+         *
+         * <p>{@code getIfUnique} rather than {@code getIfAvailable}: with two handler beans and no
+         * {@code @Primary}, the latter throws during context refresh naming neither the listener
+         * nor the attribute. Ambiguity here should be a warning that says which listener to
+         * annotate, not a startup failure with no address on it.
+         */
+        private SolaceListenerErrorHandler resolveErrorHandler(SolaceListenerEndpoint endpoint) {
+            String name = endpoint.errorHandler();
+            if (name != null && !name.isBlank()) {
+                return beanFactory.getBean(name, SolaceListenerErrorHandler.class);
+            }
+            SolaceListenerErrorHandler unique = errorHandlers.getIfUnique();
+            if (unique == null && errorHandlers.stream().findAny().isPresent()) {
+                log.warn("Listener '{}' names no errorHandler and several "
+                        + "SolaceListenerErrorHandler beans exist, so none is applied and handler "
+                        + "exceptions become error replies. Name one with "
+                        + "@SolaceListener(errorHandler = \"beanName\").", endpoint.id());
+            }
+            return unique;
         }
 
         public List<SolaceMessageListenerContainer> containers() { return List.copyOf(containers); }

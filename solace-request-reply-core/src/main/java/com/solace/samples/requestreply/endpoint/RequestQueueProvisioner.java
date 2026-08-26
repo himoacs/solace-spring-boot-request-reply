@@ -1,6 +1,7 @@
 package com.solace.samples.requestreply.endpoint;
 
 import com.solace.samples.requestreply.config.SolaceRequestReplyProperties;
+import com.solace.samples.requestreply.config.SolaceRequestReplyProperties.AccessType;
 import com.solace.samples.requestreply.config.SolaceRequestReplyProperties.ProvisionMode;
 import com.solace.samples.requestreply.exception.EndpointProvisioningException;
 import com.solace.samples.requestreply.transport.SolaceSession;
@@ -19,17 +20,20 @@ import java.util.List;
 /**
  * Creates or verifies the shared request queue and maps its topic subscriptions.
  *
- * <h2>Why the modes collapse to one call</h2>
+ * <h2>Why there is only one provisioning call</h2>
  * A spike against a live broker settled how {@code provision} behaves (see {@code spike/}):
- * {@code FLAG_IGNORE_ALREADY_EXISTS} suppresses only "already exists", subcode 33. A queue
- * that exists with <em>different</em> properties still raises
- * {@link PropertyMismatchException}, which carries the offending property name and the value
- * the broker actually holds.
+ * {@code FLAG_IGNORE_ALREADY_EXISTS} suppresses only "already exists", subcode 33 — it has no
+ * bearing on whether a <em>missing</em> queue gets created. {@code provision()} creates a
+ * missing endpoint unconditionally, flag or no flag; the flag only decides whether an
+ * <em>existing, matching</em> queue is tolerated or rejected. A queue that exists with
+ * <em>different</em> properties still raises {@link PropertyMismatchException} regardless,
+ * carrying the offending property name and the value the broker actually holds.
  *
- * <p>So drift is loud rather than silent, and {@code CREATE_IF_MISSING} is safe to ship as the
- * default. It also means {@code CREATE_IF_MISSING} and {@code VALIDATE} issue the *same* call
- * and differ only in whether a missing queue is an error — two modes, one code path, and no
- * SEMP required to detect drift.
+ * <p>That ruled out ever offering a "validate without creating" mode honestly — there is no
+ * flag for it, and probing existence some other way first is machinery this library does not
+ * carry for a mode whose entire appeal was supposed to be doing less, not more. So drift
+ * detection is a property of {@code CREATE_IF_MISSING} alone, and it is loud rather than silent,
+ * which is what makes {@code CREATE_IF_MISSING} safe to ship as the default.
  */
 public class RequestQueueProvisioner {
 
@@ -47,10 +51,9 @@ public class RequestQueueProvisioner {
     /** @return the queue, ready to bind flows against. */
     public Queue ensure(String queueName, List<String> topics) {
         Queue queue = JCSMPFactory.onlyInstance().createQueue(queueName);
-        ProvisionMode mode = cfg.getProvision().getMode();
 
-        if (mode != ProvisionMode.OFF) {
-            provision(queue, queueName, mode);
+        if (cfg.getProvision().getMode() != ProvisionMode.OFF) {
+            provision(queue, queueName);
         } else {
             log.info("Request queue '{}': provision mode OFF, assuming it exists", queueName);
         }
@@ -59,10 +62,10 @@ public class RequestQueueProvisioner {
         return queue;
     }
 
-    private void provision(Queue queue, String queueName, ProvisionMode mode) {
+    private void provision(Queue queue, String queueName) {
         EndpointProperties props = new EndpointProperties();
         props.setPermission(EndpointProperties.PERMISSION_CONSUME);
-        props.setAccessType("EXCLUSIVE".equalsIgnoreCase(cfg.getAccessType())
+        props.setAccessType(cfg.getAccessType() == AccessType.EXCLUSIVE
                 ? EndpointProperties.ACCESSTYPE_EXCLUSIVE
                 : EndpointProperties.ACCESSTYPE_NONEXCLUSIVE);
         props.setQuota(cfg.getProvision().getQuotaMb());
@@ -72,11 +75,9 @@ public class RequestQueueProvisioner {
                 ? EndpointProperties.DISCARD_NOTIFY_SENDER_ON
                 : EndpointProperties.DISCARD_NOTIFY_SENDER_OFF);
 
-        long flags = JCSMPSession.WAIT_FOR_CONFIRM
-                | (mode == ProvisionMode.CREATE_IF_MISSING ? JCSMPSession.FLAG_IGNORE_ALREADY_EXISTS : 0);
-
         try {
-            session.jcsmp().provision(queue, props, flags);
+            session.jcsmp().provision(queue, props,
+                    JCSMPSession.WAIT_FOR_CONFIRM | JCSMPSession.FLAG_IGNORE_ALREADY_EXISTS);
             log.info("Request queue '{}' provisioned/verified: accessType={} quota={}MB "
                             + "maxRedelivery={} respectsTtl={} notifySenderOnDiscard={}",
                     queueName, cfg.getAccessType(), cfg.getProvision().getQuotaMb(),
@@ -93,12 +94,6 @@ public class RequestQueueProvisioner {
                             + "provision.mode=OFF to accept the broker's settings.", e);
 
         } catch (JCSMPErrorResponseException e) {
-            if (mode == ProvisionMode.VALIDATE
-                    && e.getSubcodeEx() == com.solacesystems.jcsmp.JCSMPErrorResponseSubcodeEx.UNKNOWN_QUEUE_NAME) {
-                throw new EndpointProvisioningException(queueName,
-                        "does not exist and provision.mode=VALIDATE will not create it. "
-                                + "Create it, or use CREATE_IF_MISSING.", e);
-            }
             throw new EndpointProvisioningException(queueName,
                     "provisioning failed (subcode=" + e.getSubcodeEx() + ", '" + e.getResponsePhrase() + "')", e);
 

@@ -33,6 +33,12 @@ public class ProvisionDriftSpike {
         System.out.println("\nSTEP 5  re-provision existing WITHOUT the ignore flag");
         provision(q, 100, 3, JCSMPSession.WAIT_FOR_CONFIRM);
 
+        Queue missing = JCSMPFactory.onlyInstance().createQueue("q.spike.drift.missing");
+        try { session.deprovision(missing, JCSMPSession.FLAG_IGNORE_DOES_NOT_EXIST); } catch (Exception ignore) {}
+        System.out.println("\nSTEP 6  provision a MISSING queue WITHOUT the ignore flag   <-- does it refuse, or create it?");
+        provision(missing, 100, 3, JCSMPSession.WAIT_FOR_CONFIRM);
+        try { session.deprovision(missing, JCSMPSession.FLAG_IGNORE_DOES_NOT_EXIST); } catch (Exception ignore) {}
+
         System.out.println("\nsubcode reference:");
         System.out.println("  ENDPOINT_ALREADY_EXISTS    = " + JCSMPErrorResponseSubcodeEx.ENDPOINT_ALREADY_EXISTS);
         System.out.println("  ENDPOINT_PROPERTY_MISMATCH = " + JCSMPErrorResponseSubcodeEx.ENDPOINT_PROPERTY_MISMATCH);

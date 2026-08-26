@@ -10,6 +10,7 @@ import com.solacesystems.jcsmp.FlowReceiver;
 import com.solacesystems.jcsmp.JCSMPException;
 import com.solacesystems.jcsmp.JCSMPProperties;
 import com.solacesystems.jcsmp.Queue;
+import com.solacesystems.jcsmp.XMLMessage;
 import com.solacesystems.jcsmp.XMLMessageListener;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -54,6 +55,12 @@ public class FlowConsumer implements AutoCloseable {
             fp.setAckMode(clientAck
                     ? JCSMPProperties.SUPPORTED_MESSAGE_ACK_CLIENT
                     : JCSMPProperties.SUPPORTED_MESSAGE_ACK_AUTO);
+            if (clientAck) {
+                // Lets a handler settle a message FAILED to actively request redelivery, rather
+                // than merely leaving it unacknowledged -- which only redelivers on disconnect,
+                // not on demand. Only CLIENT-ack flows ever call settle() themselves.
+                fp.addRequiredSettlementOutcomes(XMLMessage.Outcome.FAILED);
+            }
             // The queue already exists; do not let flow creation try to re-provision it.
             EndpointProperties ep = new EndpointProperties();
             flow = session.jcsmp().createFlow(new Listener(), fp, ep, new Events());

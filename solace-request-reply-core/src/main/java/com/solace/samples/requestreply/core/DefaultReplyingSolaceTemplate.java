@@ -1,6 +1,5 @@
 package com.solace.samples.requestreply.core;
 
-import com.solace.samples.requestreply.api.PublishResult;
 import com.solace.samples.requestreply.api.ReplyingSolaceTemplate;
 import com.solace.samples.requestreply.api.RequestReplyFuture;
 import com.solace.samples.requestreply.api.RequestReplyMessage;
@@ -8,6 +7,7 @@ import com.solace.samples.requestreply.api.SolaceHeaders;
 import com.solace.samples.requestreply.config.SolaceRequestReplyProperties;
 import com.solace.samples.requestreply.endpoint.ReplyEndpoint;
 import com.solace.samples.requestreply.exception.RemoteErrorException;
+import com.solace.samples.requestreply.exception.RequestReplyException;
 import com.solace.samples.requestreply.exception.RequestTimeoutException;
 import com.solace.samples.requestreply.exception.TransportException;
 import com.solace.samples.requestreply.latency.LatencyRecorder;
@@ -27,7 +27,6 @@ import java.time.Duration;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.UUID;
-import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Function;
@@ -59,7 +58,6 @@ public class DefaultReplyingSolaceTemplate implements ReplyingSolaceTemplate, Au
     private final LatencyRecorder latency;
 
     private final AtomicLong sequence = new AtomicLong();
-    private final Map<String, Long> publishConfirmNanos = new java.util.concurrent.ConcurrentHashMap<>();
     private final Map<String, Expression> replyPlaceholderExpressions = new java.util.LinkedHashMap<>();
 
     private volatile FlowConsumer replyFlow;
@@ -98,8 +96,10 @@ public class DefaultReplyingSolaceTemplate implements ReplyingSolaceTemplate, Au
         replyFlow = new FlowConsumer(session, replyEndpoint.queue(), "reply", false, this::onReplyMessage);
         replyFlow.start();
         reaper.start();
-        log.info("Request/reply template ready. replyTopic={} subscription={}",
-                replyEndpoint.replyTopic(Map.of()), replyEndpoint.subscription());
+        // The reply-to template, not a concrete reply-to: per-request levels are wildcards here
+        // and are filled in per request, so this string equals the subscription by construction.
+        log.info("Request/reply template ready. replyTo={} queue={}",
+                replyEndpoint.subscription(), replyEndpoint.queue().getName());
     }
 
 
@@ -121,7 +121,7 @@ public class DefaultReplyingSolaceTemplate implements ReplyingSolaceTemplate, Au
     }
 
     @Override
-    public String replyTopic() { return replyEndpoint.replyTopic(Map.of()); }
+    public String replyTopicPattern() { return replyEndpoint.subscription(); }
 
     @Override
     public Duration defaultReplyTimeout() { return props.getRequest().getTimeout(); }
@@ -170,15 +170,20 @@ public class DefaultReplyingSolaceTemplate implements ReplyingSolaceTemplate, Au
         PublishTicket ticket = new PublishTicket(correlationId, topic, startNanos);
         RequestReplyFuture<RequestReplyMessage> future = new RequestReplyFuture<>(ticket.sendFuture());
 
+        PendingRequest pending = new PendingRequest(correlationId, topic,
+                System.currentTimeMillis() + timeout.toMillis(), timeout.toMillis(), startNanos,
+                future);
         // Register BEFORE publishing: a fast replier on the same broker can return a reply
         // before the publish acknowledgement arrives, and registering afterwards would drop it.
-        store.register(new PendingRequest(correlationId, topic,
-                System.currentTimeMillis() + timeout.toMillis(), timeout.toMillis(), startNanos,
-                future));
+        store.register(pending);
 
         ticket.sendFuture().whenComplete((res, err) -> {
             if (res != null) {
-                publishConfirmNanos.put(correlationId, res.confirmNanos());
+                // Setting it directly on the same object the store owns, rather than a separate
+                // map keyed by correlation id, is what stops a confirmation that arrives after
+                // completion or expiry from leaking: this value dies with the request it belongs
+                // to instead of surviving in a container with no matching removal path.
+                pending.setConfirmNanos(res.confirmNanos());
             } else if (err != null) {
                 // No point waiting out the timeout for a reply to a request that never landed.
                 store.remove(correlationId).ifPresent(p -> {
@@ -231,8 +236,7 @@ public class DefaultReplyingSolaceTemplate implements ReplyingSolaceTemplate, Au
 
         store.remove(correlationId).ifPresentOrElse(pending -> {
             long total = System.nanoTime() - pending.getStartNanos();
-            long confirm = publishConfirmNanos.getOrDefault(correlationId, 0L);
-            publishConfirmNanos.remove(correlationId);
+            long confirm = pending.getConfirmNanos();
             long handler = parseLong(reply.getHeader(SolaceHeaders.HANDLER_NANOS));
 
             LatencySample.Outcome outcome = reply.isError()
@@ -255,8 +259,7 @@ public class DefaultReplyingSolaceTemplate implements ReplyingSolaceTemplate, Au
     }
 
     private void expire(PendingRequest pending) {
-        long confirm = publishConfirmNanos.getOrDefault(pending.getCorrelationId(), 0L);
-        publishConfirmNanos.remove(pending.getCorrelationId());
+        long confirm = pending.getConfirmNanos();
         latency.record(sampleFor(pending, LatencySample.Outcome.TIMEOUT, confirm, 0L));
         completeExceptionally(pending, new RequestTimeoutException(
                 pending.getCorrelationId(), pending.getRequestTopic(),
@@ -304,9 +307,20 @@ public class DefaultReplyingSolaceTemplate implements ReplyingSolaceTemplate, Au
     @Override
     public void close() {
         reaper.close();
+        // Anything still waiting for a reply gets told plainly rather than left to hang or time
+        // out with no explanation. store.remove(id) is what CorrelationStore documents as the
+        // ownership decision, so a reply that is genuinely mid-flight and wins that race still
+        // completes normally instead of being cut off here.
+        for (PendingRequest p : store.pending()) {
+            store.remove(p.getCorrelationId()).ifPresent(owned ->
+                    completeExceptionally(owned, new RequestReplyException(
+                            "Template is shutting down; correlationId=" + owned.getCorrelationId()
+                                    + " will not receive a reply")));
+        }
         if (replyFlow != null) { replyFlow.close(); }
         replyEndpoint.close();
-        publisher.close();
-        completionExecutor.shutdown();
+        // publisher and completionExecutor are not ours to close: both are beans with their own
+        // destroyMethod, and the publisher is shared with every listener container -- closing it
+        // here raced against their shutdown with no ordering guarantee between the two beans.
     }
 }

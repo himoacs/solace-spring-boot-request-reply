@@ -7,11 +7,12 @@ import java.util.concurrent.CompletableFuture;
 /**
  * An in-flight request awaiting its reply.
  *
- * <p>Carries the captured observability context alongside the future. That is not incidental:
- * {@code future.complete()} runs its dependents on whichever thread called it — the JCSMP
- * dispatch thread, whose current context is the <em>reply's</em> receive context, not the
- * request's. Restoring the captured context on completion is what keeps a trace's causality
- * correct rather than merely connected.
+ * <p>{@code confirmNanos} is set later than construction, once the broker confirms the publish —
+ * which can arrive before or after the reply itself. It lives here rather than in a separate map
+ * keyed by correlation id on purpose: a map like that has no natural removal point that lines up
+ * with every completion path, and a confirmation arriving after the request was already removed
+ * from the correlation store leaks forever. This value dies with the object the store already
+ * owns, so there is nothing left over to leak.
  */
 public final class PendingRequest {
 
@@ -20,7 +21,7 @@ public final class PendingRequest {
     private final long deadlineEpochMs;
     private final long timeoutMs;
     private final long startNanos;
-    private final long publishConfirmNanosHolder;
+    private volatile long confirmNanos;
     private final CompletableFuture<RequestReplyMessage> future;
 
     public PendingRequest(String correlationId, String requestTopic, long deadlineEpochMs,
@@ -31,7 +32,6 @@ public final class PendingRequest {
         this.deadlineEpochMs = deadlineEpochMs;
         this.timeoutMs = timeoutMs;
         this.startNanos = startNanos;
-        this.publishConfirmNanosHolder = 0L;
         this.future = future;
     }
 
@@ -41,6 +41,12 @@ public final class PendingRequest {
     public long getTimeoutMs() { return timeoutMs; }
     public long getStartNanos() { return startNanos; }
     public CompletableFuture<RequestReplyMessage> getFuture() { return future; }
+
+    /** Time from send to broker acknowledgement, or 0 if the confirmation has not arrived yet. */
+    public long getConfirmNanos() { return confirmNanos; }
+
+    /** Set once, from the publish-confirm callback; may run before or after completion. */
+    public void setConfirmNanos(long v) { this.confirmNanos = v; }
 
     public boolean isExpired(long nowEpochMs) { return nowEpochMs >= deadlineEpochMs; }
 }

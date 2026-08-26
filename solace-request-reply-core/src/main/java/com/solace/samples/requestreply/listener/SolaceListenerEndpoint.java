@@ -13,7 +13,7 @@ import java.util.List;
  * @param method       the handler method
  * @param queue        queue to bind — the consumer group
  * @param topics       subscriptions to map onto the queue
- * @param concurrency  flows to bind
+ * @param concurrency  flows to bind, and the size of this listener's own handler pool
  * @param clientAck    CLIENT acknowledgement, required for reply-then-ack ordering
  * @param replyTo      explicit @SendTo destination, or null to use the request's reply-to
  * @param sendReply    whether the return value should be published at all

@@ -40,7 +40,7 @@ public class ReplyEndpointFactory {
         // of its requests times out with no error anywhere.
         log.info("Reply endpoint identity: instanceId={} queue={}", instanceId, queueName);
 
-        return new DurableReplyEndpoint(session, pattern, queueName, cfg.getQuotaMb());
+        return new DurableReplyEndpoint(session, pattern, queueName, cfg.getQuotaMb(), cfg.getProvisionMode());
     }
 
     /**

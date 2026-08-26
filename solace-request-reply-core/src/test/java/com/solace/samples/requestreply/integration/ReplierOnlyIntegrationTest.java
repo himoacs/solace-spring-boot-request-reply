@@ -1,17 +1,25 @@
 package com.solace.samples.requestreply.integration;
 
 import com.solace.samples.requestreply.api.ReplyingSolaceTemplate;
+import com.solace.samples.requestreply.config.ReplyPathHealthIndicator;
+import com.solace.samples.requestreply.config.SolaceSessionHealthIndicator;
 import com.solace.samples.requestreply.endpoint.ReplyEndpoint;
 import com.solace.samples.requestreply.support.SolaceTestBroker;
 import com.solace.samples.requestreply.support.TestApp;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.actuate.health.Health;
+import org.springframework.boot.actuate.health.Status;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.context.ApplicationContext;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 
+import java.util.List;
+
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.awaitility.Awaitility.await;
+import static java.time.Duration.ofSeconds;
 
 /**
  * A replier provisions no reply queue of its own.
@@ -53,6 +61,24 @@ class ReplierOnlyIntegrationTest {
 
     @Autowired ApplicationContext context;
     @Autowired TestApp.CountingHandler handler;
+    @Autowired SolaceSessionHealthIndicator sessionHealth;
+
+    @Test
+    void reportsHealthEvenWithoutAReplyPath() {
+        // The gap this closes: ReplyPathHealthIndicator is gated on reply.enabled, so a
+        // replier-only process was left with no Solace health signal at all.
+        assertThat(context.getBeanNamesForType(ReplyPathHealthIndicator.class))
+                .as("no reply path to report on, so this one must be absent rather than half-working")
+                .isEmpty();
+
+        await().atMost(ofSeconds(10)).untilAsserted(() -> {
+            Health health = sessionHealth.health();
+            assertThat(health.getStatus()).isEqualTo(Status.UP);
+            assertThat(health.getDetails()).containsEntry("sessionConnected", true);
+            assertThat((Integer) health.getDetails().get("listenersDeclared")).isEqualTo(1);
+            assertThat((List<?>) health.getDetails().get("listenersNotRunning")).isEmpty();
+        });
+    }
 
     @Test
     void provisionsNoReplyQueue() {

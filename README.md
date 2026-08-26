@@ -117,6 +117,34 @@ payment systems are built on:
    keeps the broker's copy authoritative: until the reply is safely stored, the request is still on
    the queue and still redeliverable, so a crash anywhere in between costs nothing.
 
+### Acknowledgement modes: CLIENT and AUTO
+
+That "acknowledge last" guarantee is specific to `@SolaceListener(ackMode = "CLIENT")`, the
+default. A second mode, `AUTO`, exists because JCSMP exposes it — but it gives up more than it
+looks like at first glance, so it is worth being explicit about what each one buys you.
+
+`CLIENT`: the container acknowledges the request itself, only once the reply is published and the
+broker has confirmed it, as above. A handler that throws `RetryableHandlerException`, or a reply
+that fails to publish, gets an active redelivery — the container settles the request FAILED on
+your behalf, subject to `replier.provision.max-redelivery`.
+
+`AUTO`: JCSMP acknowledges for you, and — confirmed against a live broker, not just the docs — it
+does so the instant the handler returns, regardless of what the handler actually did. That has two
+consequences, not one:
+
+- **It blocks the whole process, not just its own queue.** Every flow in a session shares one
+  JCSMP dispatch thread, so an `AUTO` handler has to run directly on that thread rather than this
+  listener's own pool, the way `CLIENT` handlers do. A slow `AUTO` handler stalls every other
+  listener and every reply in the process for as long as it takes to return.
+- **It has no failure path at all.** The settlement outcomes that make `CLIENT`'s active
+  redelivery possible are a CLIENT-ack-only capability in JCSMP itself. A `RetryableHandlerException`
+  or a broken reply-publish cannot force a redelivery under `AUTO` — JCSMP has already decided to
+  acknowledge the message by the time either of those runs, and nothing the handler does can
+  change that afterwards.
+
+`AUTO` fits a fast handler that sends no reply and can tolerate an occasional failure disappearing
+unnoticed. `CLIENT` is the right choice for everything else, including anything that replies.
+
 ---
 
 ## Topic taxonomy and wildcards
@@ -222,7 +250,7 @@ message queue are all created if they do not exist.
 |---|---|---|
 | `reply.enabled` | `true` | Set `false` on a replier-only process. A replier is never addressed on a reply queue, so leaving it on provisions a durable queue that is subscribed, bound and never used — and under a Kubernetes Deployment, strands one per pod on every rollout. |
 | `reply.instance-id` | hostname | Must be unique per instance and stable across restarts. The reply queue is durable and exclusive, so two instances sharing an id bind the same queue and the second silently receives nothing. |
-| `request.ttl-matches-timeout` | `true` | Stops a replier acting on a request after the requestor has given up. Turning it off can produce work nobody is waiting for. |
+| `request.ttl-matches-timeout` | `true` | Bounds how long an undelivered request can wait on the queue. It does **not** stop a replier that has already picked the request up: TTL is enforced by elapsed time alone, independent of delivery state — see [What actually reaches the DMQ](#what-actually-reaches-the-dmq). |
 | `replier.provision.max-redelivery` | `3` | Zero means redeliver forever, so one malformed message loops indefinitely. |
 | `java.reconnect-retries` | — | Set this to at least 100 with a 3000 ms wait, which gives the 300 seconds needed to survive an HA failover. The commonly copied value of 20 only gives 60 seconds. |
 | `dmq.enabled` | `true` | On, because the alternative is deleting a message the system failed to process. Turning it off restores silent discard. |
@@ -260,12 +288,25 @@ requestor-side template and the reply-path health indicator, and the process say
 
 ### Provisioning modes
 
-`replier.provision.mode` accepts `CREATE_IF_MISSING` (the default), `VALIDATE` and `OFF`.
+`replier.provision.mode` and `reply.provision-mode` both accept `CREATE_IF_MISSING` (the
+default) and `OFF` — two modes, not three. A "validate but never create" mode looks appealing,
+but JCSMP has no such call: `provision()` creates a missing endpoint unconditionally, flag or no
+flag — verified against a live broker; see [spike/README.md](spike/README.md). Offering that
+mode honestly would mean probing existence some other way before ever calling `provision()`,
+which is machinery this library does not carry for a mode whose entire appeal was supposed to be
+doing less, not more.
 
 Creating on startup is safe to leave enabled because configuration drift is reported rather than
-ignored. `FLAG_IGNORE_ALREADY_EXISTS` only suppresses the "already exists" error. If the queue
-exists with different properties, JCSMP raises `PropertyMismatchException`, which names the property
-that differs. This was verified against a live broker; see [spike/README.md](spike/README.md).
+ignored, independently of that: `FLAG_IGNORE_ALREADY_EXISTS` only suppresses the "already exists"
+error. If the queue exists with different properties, JCSMP raises `PropertyMismatchException`,
+which names the property that differs — whether or not the queue had to be created.
+
+`reply.provision-mode: OFF` is the requestor's equivalent of `replier.provision.mode: OFF`: on a
+message VPN whose client profile forbids creating endpoints, the replier already had this escape
+hatch and the requestor did not, simply failing to start. Because the reply queue is named per
+instance rather than shared, using `OFF` here means provisioning one queue per instance identity
+out of band in advance — practical when identities are known ahead of time, such as a
+StatefulSet's stable ordinals.
 
 
 ### Dead message queues
@@ -289,10 +330,27 @@ solace:
       reply-ttl:                  # unset: follow request.timeout. 0s disables expiry.
 ```
 
-**One shared queue, deliberately.** A DMQ per endpoint would need `deadMsgQueue` set on each source
-queue over SEMP. Every queue already points at `#DEAD_MSG_QUEUE`, so using it needs no management
-credentials at all. Dead-lettered messages keep their original topic, so `…/request/v1/…` and
-`…/reply/v1/…` remain easy to tell apart when you inspect the queue.
+**One shared queue, deliberately.** Every queue's `deadMsgQueue` already points at
+`#DEAD_MSG_QUEUE`, so using it needs no management credentials at all. Dead-lettered messages keep
+their original topic, so `…/request/v1/…` and `…/reply/v1/…` remain easy to tell apart when you
+inspect the queue.
+
+**Using a different DMQ is a broker-side change, not a property.** `dmq.name` provisions and reports
+the queue you name; it does not route to it. Which queue a message dead-letters into is
+`deadMsgQueue` on the *source* queue, and JCSMP cannot set it — `EndpointProperties` has no such
+property, so no client can. Set it yourself on the request queue and on every reply queue, then
+point `dmq.name` at the same value so provisioning and diagnostics agree:
+
+```bash
+curl -u admin:admin -X PATCH \
+  'http://localhost:8085/SEMP/v2/config/msgVpns/default/queues/q.cris.booking.seatReserve' \
+  -H 'Content-Type: application/json' \
+  -d '{"deadMsgQueue":"q.cris.booking.dmq"}'
+```
+
+A non-default `dmq.name` logs a warning at startup saying exactly this, because otherwise the gap is
+invisible: the queue is created, diagnostics report `established: true`, and dead messages keep
+going to the VPN default.
 
 The DMQ is provisioned with `respectsMsgTTL=false`. These messages are here *because* they expired;
 honouring their TTL again would expire them straight back out of the one place they are meant to
@@ -309,14 +367,52 @@ Less obvious than it looks, and worth knowing before you go hunting for a messag
 | Situation | Dead-lettered? |
 |---|---|
 | Request expires on the queue with no replier consuming it | yes |
+| Request already delivered to a replier, still waiting behind other work when its TTL elapses | yes — **the replier can go on to finish the work anyway** |
 | Request redelivered past `max-redelivery` — a replier crashing before it acknowledges | yes |
 | Reply published, requestor already gone, `reply-ttl` elapsed | yes |
-| Handler throws | **no** — that becomes an error reply, and the request is acknowledged |
+| Handler throws `RetryableHandlerException` | after `max-redelivery` redeliveries — **yes**; before that, redelivered, not yet |
+| Handler throws anything else | **no** — that becomes an error reply, and the request is acknowledged |
 | Handler returns `null` (the demo's `simulate=timeout`) | **no** — it declines to reply but still acknowledges |
 
-The last two are the ones that surprise people. "The requestor timed out" and "the request was
-dead-lettered" are different events: a handler that runs to completion and simply says nothing has
-consumed the request quite legitimately, so there is nothing left to dead-letter.
+The second row is the one worth sitting with. Verified against a live broker: a message delivered
+to a client and left unacknowledged — exactly what happens while it waits its turn in a busy
+handler pool — is still dead-lettered by the broker at its TTL deadline. The broker does not check
+delivery state before discarding its own copy, and it does not reach out to reclaim the client's;
+it simply writes that client off and moves on. The client has no way to learn this happened —
+acknowledging a message the broker has already dead-lettered raises no error at all — so a handler
+can run to completion and produce a real side effect (a reserved seat, in the demo) for a request
+that is simultaneously sitting in the DMQ looking exactly like a request that was never processed.
+
+That matters most for recovery. **A DMQ entry is not proof the work never happened.** Anything that
+replays one — an operator, a script — must reuse the *original* correlation id for
+[the idempotency guard](#guaranteed-delivery-and-the-idempotency-that-completes-it) to recognize it
+as a repeat; a replay that assigns a fresh id will not be caught, and produces a second, genuine
+reservation for a booking that already succeeded.
+
+The last two rows in the table are the other ones that surprise people. "The requestor timed out"
+and "the request was dead-lettered" are different events: a handler that runs to completion and
+simply says nothing has consumed the request quite legitimately, so there is nothing left to
+dead-letter.
+
+### Retrying a transient handler failure
+
+Every exception a handler throws becomes an error reply by default — the requestor is told
+immediately, and the request is acknowledged, because the work is considered done, badly. That is
+right for a failure that will not change on a second attempt. It is wrong for one that might
+succeed a moment later, such as a database connection blip: turning that into a permanent failure
+is how a transient hiccup becomes a booking the customer is told never happened.
+
+Throw `RetryableHandlerException` instead, and the request is settled `FAILED` rather than
+acknowledged — an active request to the broker to redeliver, which is what actually triggers
+another attempt; a merely-unacknowledged message only redelivers on the next reconnect. Exhausted
+attempts dead-letter exactly like any other, per `replier.provision.max-redelivery`.
+
+This does not make the original caller's call succeed — its own `request.timeout` still runs out
+regardless of how many attempts follow. What it buys is that the work is not silently turned into
+a permanent failure the moment a transient error is hit. It is also bounded by the request's own
+TTL, which by default equals `request.timeout` via `ttl-matches-timeout`: a message can expire off
+the queue mid-retry before `max-redelivery` is even reached. Raise `request.timeout` if a handler
+needs real retry budget rather than one fast attempt.
 
 ### Broker version affects this
 
@@ -374,13 +470,14 @@ created means the broker goes back to deleting.
 
 | Concept | Kafka behaviour | Solace behaviour |
 |---|---|---|
-| Ordering | guaranteed within a partition | the queue itself preserves order. Order is lost only when several consumer flows bind to one queue and process in parallel — which is exactly what `concurrency` above 1 does. Keep it by giving each consumer its own queue; queues are cheap in Solace, so fanning one topic subscription out to several is a normal pattern. |
+| Ordering | guaranteed within a partition | the queue preserves order; this library does not. `@SolaceListener(concurrency)` sizes this listener's own handler pool as well as its flow count, so replies can complete out of order the moment it is above 1 — even with a single flow. Set it to `1` for a listener that needs strict ordering; beyond that, give an ordered stream its own queue, since queues are cheap in Solace. |
 | Provisioning | you provision topics | the reverse. Topics are just strings and need no setup, while queues are objects with permissions. |
 | Replay | messages are retained by time or size, and you can seek | a queue drains as messages are acknowledged. Reprocessing needs the separate Message Replay feature. |
 | Rebalancing | partitions are reassigned in a stop-the-world rebalance | messages are distributed one at a time across the bound flows. Adding an instance takes effect immediately, with no rebalance. |
 | Filtering | topic names are flat, so consumers filter in the application | topics are hierarchical and the broker filters per message. |
 | Dead letters | a client-side recoverer republishes to a `.DLT` topic | the broker moves messages to a dead message queue, with no client code involved. On by default here; see [Dead message queues](#dead-message-queues). |
 | Queue browsing | not applicable | a queue can be browsed non-destructively, which is how you inspect the DMQ. |
+| Acknowledgement | `AckMode.RECORD` and friends layer commit-after-processing over a raw `enable.auto.commit` that is really commit-on-a-timer | `@SolaceListener(ackMode = "CLIENT")` (the default) acks after processing, same idea as `AckMode.RECORD`; `AUTO` hands acking to JCSMP itself and gives up more than the name suggests — see [Acknowledgement modes: CLIENT and AUTO](#acknowledgement-modes-client-and-auto). |
 
 ---
 
@@ -459,7 +556,6 @@ The report always states which mode produced it.
 |---|---|
 | `POST /api/bookings` | one reservation, with a latency breakdown |
 | `POST /api/bookings` with `"simulate"` | `timeout`, `remote-error` or `slow-handler`, to reproduce each failure mode |
-| `POST /api/bookings/replay?correlationId=…` | resend a request under a chosen correlation id, to check idempotency |
 | `GET /api/diagnostics/endpoints` | what was actually provisioned, rather than what was configured |
 | `GET /api/diagnostics/reply-path` | whether this instance's reply path is bound and subscribed |
 | `POST /api/latency/start` and `POST /api/latency/report` | exact percentiles over ad-hoc traffic |
@@ -473,7 +569,7 @@ The report always states which mode produced it.
 ./mvnw test        # starts a broker with Testcontainers
 ```
 
-Fifteen integration tests run against a real broker. The behaviour that matters here belongs to the
+Sixteen integration tests run against a real broker. The behaviour that matters here belongs to the
 interaction with the broker, so a test that mocked it would not catch the problems these are written
 to catch.
 
@@ -485,6 +581,7 @@ to catch.
 | `ReplierOnlyIntegrationTest` | with `reply.enabled=false` the context starts, has no reply endpoint or template, still binds the request queue, and provisions no reply queue on the broker |
 | `MinimalConfigIntegrationTest` | the minimal configuration shown in this README actually round-trips, so the example cannot rot |
 | `DmqIntegrationTest` | the DMQ is provisioned at startup; an expired request is kept there rather than deleted, carrying the published eligibility flag; reply TTL derives from `request.timeout` unless set |
+| `ErrorHandlerRoutingIntegrationTest` | `@SolaceListener(errorHandler = "…")` selects a handler by bean name, and two handler beans in one context no longer break startup |
 
 The tests use `GenericContainer` rather than the Testcontainers Solace module. The module rejects
 `default` as a client username, and does not set `container=docker` or a large enough shared memory

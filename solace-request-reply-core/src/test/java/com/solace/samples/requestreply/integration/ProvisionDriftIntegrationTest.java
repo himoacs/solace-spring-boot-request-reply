@@ -68,8 +68,8 @@ class ProvisionDriftIntegrationTest {
                 .isInstanceOf(PropertyMismatchException.class)
                 .satisfies(e -> {
                     PropertyMismatchException pm = (PropertyMismatchException) e;
-                    // The property name and the broker's value are what let VALIDATE mode report a
-                    // useful diff with no SEMP call and no string parsing.
+                    // The property name and the broker's value are what let CREATE_IF_MISSING
+                    // report a useful diff with no SEMP call and no string parsing.
                     assertThat(pm.getProperty()).isNotBlank();
                     assertThat(pm.getPropertyValue()).isNotNull();
                 });

@@ -52,6 +52,18 @@ public interface ReplyingSolaceTemplate {
      */
     boolean waitForReplyEndpoint(Duration timeout);
 
-    /** The reply topic this instance publishes as its reply-to. */
-    String replyTopic();
+    /**
+     * The reply-to <em>template</em> for this instance, with per-request levels shown as
+     * {@code *}.
+     *
+     * <p>Not the reply-to of any particular request. Levels listed in
+     * {@code reply.per-request-placeholders} are only known once there is a request to derive
+     * them from, so here they appear as the wildcard the subscription actually uses:
+     *
+     * <pre>
+     * template   cris/booking/seatReserve/reply/v1/nr/&#42;/booking-1
+     * a request  cris/booking/seatReserve/reply/v1/nr/12951/booking-1
+     * </pre>
+     */
+    String replyTopicPattern();
 }

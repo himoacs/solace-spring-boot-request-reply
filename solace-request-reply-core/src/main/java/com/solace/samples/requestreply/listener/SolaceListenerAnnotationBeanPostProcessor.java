@@ -90,9 +90,28 @@ public class SolaceListenerAnnotationBeanPostProcessor implements BeanPostProces
                 replyTo, sendReply, resolve(ann.errorHandler()));
     }
 
+    /**
+     * Resolves a {@code ${...}} property placeholder. Deliberately not SpEL: Spring Kafka's
+     * {@code @SendTo} also accepts {@code #{...}} (evaluated against the bean factory) and
+     * {@code !{...}} (evaluated against the inbound record) — the latter exists there because a
+     * Kafka record has no built-in reply-to, so SpEL is how you compute one. This library
+     * already carries a dynamic reply-to on every request, so an unqualified {@code @SendTo}
+     * gets that for free without needing SpEL at all; the only case SpEL would otherwise serve, a
+     * fixed override destination, is already a {@code ${...}} placeholder away. Rather than
+     * silently treating {@code #{...}}/{@code !{...}} as a literal string and misrouting every
+     * reply to it, fail fast here so the mistake surfaces at startup, not as a request that times
+     * out with no clue why.
+     */
     private String resolve(String value) {
-        if (value == null || value.isBlank() || environment == null) { return value; }
-        return environment.resolvePlaceholders(value);
+        if (value == null || value.isBlank()) { return value; }
+        if (value.contains("#{") || value.contains("!{")) {
+            throw new IllegalStateException("'" + value + "' looks like a SpEL expression, "
+                    + "which this library does not support here (only '${...}' property "
+                    + "placeholders are resolved). @SendTo with no value already routes to the "
+                    + "request's own dynamic reply-to; for a fixed destination, use a literal or "
+                    + "a '${...}' placeholder instead.");
+        }
+        return environment == null ? value : environment.resolvePlaceholders(value);
     }
 
     /** Endpoints discovered during context refresh. */

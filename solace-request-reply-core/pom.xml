@@ -47,13 +47,13 @@
       <scope>test</scope>
     </dependency>
     <dependency>
+      <!-- GenericContainer, DockerImageName, Wait: what SolaceTestBroker actually uses. Not
+           the "solace" or "junit-jupiter" modules: neither's own abstraction is used here (see
+           SolaceTestBroker's class javadoc for why the Solace module doesn't fit), and both were
+           previously pulled in without anyone depending on them directly, leaving this the one
+           actually load-bearing artifact resolving only by accident. -->
       <groupId>org.testcontainers</groupId>
-      <artifactId>solace</artifactId>
-      <scope>test</scope>
-    </dependency>
-    <dependency>
-      <groupId>org.testcontainers</groupId>
-      <artifactId>junit-jupiter</artifactId>
+      <artifactId>testcontainers</artifactId>
       <scope>test</scope>
     </dependency>
     <dependency>

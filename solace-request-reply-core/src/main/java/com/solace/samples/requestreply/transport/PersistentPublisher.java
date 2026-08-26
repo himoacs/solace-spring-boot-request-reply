@@ -25,27 +25,28 @@ import java.util.function.Consumer;
  * {@link JCSMPStreamingPublishCorrelatingEventHandler}. Wiring that up is what makes a rejected
  * publish — a full spool, a missing permission — report itself immediately instead of
  * masquerading as a reply timeout seconds later.
+ *
+ * <p><b>PERSISTENT only, deliberately.</b> Direct messages are not acknowledged by the broker at
+ * all, so this callback never fires for them — the send future would neither complete nor fail,
+ * and the replier acknowledges a request only once its reply is confirmed spooled. Offering a
+ * delivery mode that silently removes both guarantees is worse than not offering one.
  */
 public class PersistentPublisher implements AutoCloseable {
 
     private static final Logger log = LoggerFactory.getLogger(PersistentPublisher.class);
 
     private final SolaceSession session;
-    private final DeliveryMode deliveryMode;
     private volatile XMLMessageProducer producer;
 
-
-    public PersistentPublisher(SolaceSession session, String deliveryMode) {
+    public PersistentPublisher(SolaceSession session) {
         this.session = session;
-        this.deliveryMode = "DIRECT".equalsIgnoreCase(deliveryMode)
-                ? DeliveryMode.DIRECT : DeliveryMode.PERSISTENT;
     }
 
     public synchronized void start() {
         if (producer != null) { return; }
         try {
             producer = session.jcsmp().getMessageProducer(new Acks());
-            log.info("Publisher started, deliveryMode={}", deliveryMode);
+            log.info("Publisher started, deliveryMode=PERSISTENT");
         } catch (JCSMPException e) {
             throw new TransportException("Could not create the message producer", e);
         }
@@ -65,7 +66,7 @@ public class PersistentPublisher implements AutoCloseable {
             BytesMessage msg = JCSMPFactory.onlyInstance().createMessage(BytesMessage.class);
             byte[] payload = message.getPayload();
             msg.setData(payload == null ? new byte[0] : payload);
-            msg.setDeliveryMode(deliveryMode);
+            msg.setDeliveryMode(DeliveryMode.PERSISTENT);
             if (ttlMillis > 0) { msg.setTimeToLive(ttlMillis); }
             // Without this the broker deletes the message once it expires or exhausts
             // redelivery, rather than moving it to the DMQ. JCSMP defaults it to false.
