@@ -11,7 +11,7 @@
 
   <artifactId>booking-demo</artifactId>
   <name>Train Booking Demo</name>
-  <description>Runnable train seat-reservation demo: REST facade, replier, latency harness.</description>
+  <description>Runnable train seat-reservation demo: REST facade, replier.</description>
 
   <dependencies>
     <dependency>

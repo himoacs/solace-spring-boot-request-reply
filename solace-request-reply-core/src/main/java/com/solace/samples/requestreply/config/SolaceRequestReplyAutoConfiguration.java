@@ -11,7 +11,6 @@ import com.solace.samples.requestreply.endpoint.ReplyEndpoint;
 import com.solace.samples.requestreply.endpoint.ReplyEndpointFactory;
 import com.solace.samples.requestreply.endpoint.DmqProvisioner;
 import com.solace.samples.requestreply.endpoint.RequestQueueProvisioner;
-import com.solace.samples.requestreply.latency.LatencyRecorder;
 import com.solace.samples.requestreply.listener.HandlerMethodInvoker;
 import com.solace.samples.requestreply.listener.SolaceListenerAnnotationBeanPostProcessor;
 import com.solace.samples.requestreply.listener.SolaceListenerEndpoint;
@@ -98,12 +97,6 @@ public class SolaceRequestReplyAutoConfiguration {
     }
 
 
-    @Bean
-    @ConditionalOnMissingBean
-    public LatencyRecorder.Collecting latencyRecorder() {
-        return new LatencyRecorder.Collecting();
-    }
-
     @Bean(destroyMethod = "close")
     @ConditionalOnMissingBean
     public PersistentPublisher persistentPublisher(SolaceSession session) {
@@ -148,10 +141,10 @@ public class SolaceRequestReplyAutoConfiguration {
     public ReplyingSolaceTemplate replyingSolaceTemplate(
             SolaceSession session, ReplyEndpoint replyEndpoint, PersistentPublisher publisher,
             CorrelationStore store, SolaceRequestReplyProperties props, PayloadCodec codec,
-            ExecutorService solaceCompletionExecutor, LatencyRecorder.Collecting latency) {
+            ExecutorService solaceCompletionExecutor) {
         DefaultReplyingSolaceTemplate template = new DefaultReplyingSolaceTemplate(
                 session, replyEndpoint, publisher, store, props, codec,
-                solaceCompletionExecutor, latency);
+                solaceCompletionExecutor);
         template.start();
         if (!template.waitForReplyEndpoint(props.getReply().getWaitForEndpoint())) {
             log.warn("Reply endpoint was not ready within {}; early requests may time out",

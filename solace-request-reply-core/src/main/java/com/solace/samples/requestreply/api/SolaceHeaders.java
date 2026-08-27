@@ -26,12 +26,6 @@ public final class SolaceHeaders {
     /** Prefix for arbitrary application headers. */
     public static final String USER_PREFIX = "rr_h_";
 
-    /** Replier's clock when it received the request, epoch micros. Cross-host: skew applies. */
-    public static final String REQUEST_RECEIVED_AT = "rr_req_recv_us";
-    /** Replier's clock when it published the reply, epoch micros. Cross-host: skew applies. */
-    public static final String REPLY_SENT_AT = "rr_reply_send_us";
-    /** Handler duration in nanos. A duration, so immune to clock skew. */
-    public static final String HANDLER_NANOS = "rr_handler_nanos";
     /** Monotonic publisher sequence, for gap and reordering detection under load. */
     public static final String SEQUENCE = "rr_seq";
 

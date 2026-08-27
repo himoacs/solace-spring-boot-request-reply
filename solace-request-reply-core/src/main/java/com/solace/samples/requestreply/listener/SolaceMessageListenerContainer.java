@@ -2,7 +2,6 @@ package com.solace.samples.requestreply.listener;
 
 import com.solace.samples.requestreply.api.RequestReplyMessage;
 import com.solace.samples.requestreply.api.RetryableHandlerException;
-import com.solace.samples.requestreply.api.SolaceHeaders;
 import com.solace.samples.requestreply.api.SolaceListenerErrorHandler;
 import com.solace.samples.requestreply.core.PayloadCodec;
 import com.solace.samples.requestreply.endpoint.RequestQueueProvisioner;
@@ -200,7 +199,6 @@ public class SolaceMessageListenerContainer implements AutoCloseable {
 
     private void process(BytesXMLMessage raw) {
         RequestReplyMessage request = InboundMessage.toModel(raw);
-        long handlerStart = System.nanoTime();
         Object result = null;
         RequestReplyMessage reply;
         try {
@@ -213,16 +211,13 @@ public class SolaceMessageListenerContainer implements AutoCloseable {
                 redeliver(raw, request, rhe);
                 return;
             }
-            reply = errorReply(request, cause, handlerStart);
+            reply = errorReply(request, cause);
         }
-        long handlerNanos = System.nanoTime() - handlerStart;
 
         if (reply == null) {
             acknowledge(raw, request.getCorrelationId());
             return;
         }
-        reply.addHeader(SolaceHeaders.HANDLER_NANOS, Long.toString(handlerNanos));
-        reply.addHeader(SolaceHeaders.REPLY_SENT_AT, Long.toString(System.currentTimeMillis() * 1_000));
 
         String destination = endpoint.replyTo() != null && !endpoint.replyTo().isBlank()
                 ? endpoint.replyTo() : request.getReplyTo();
@@ -270,7 +265,7 @@ public class SolaceMessageListenerContainer implements AutoCloseable {
         return request.newReply().setPayload(codec.serialize(result));
     }
 
-    private RequestReplyMessage errorReply(RequestReplyMessage request, Throwable cause, long start) {
+    private RequestReplyMessage errorReply(RequestReplyMessage request, Throwable cause) {
         if (errorHandler != null) {
             try {
                 Object handled = errorHandler.handleError(request,

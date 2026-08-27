@@ -3,15 +3,12 @@ package com.solace.samples.requestreply.core;
 import com.solace.samples.requestreply.api.ReplyingSolaceTemplate;
 import com.solace.samples.requestreply.api.RequestReplyFuture;
 import com.solace.samples.requestreply.api.RequestReplyMessage;
-import com.solace.samples.requestreply.api.SolaceHeaders;
 import com.solace.samples.requestreply.config.SolaceRequestReplyProperties;
 import com.solace.samples.requestreply.endpoint.ReplyEndpoint;
 import com.solace.samples.requestreply.exception.RemoteErrorException;
 import com.solace.samples.requestreply.exception.RequestReplyException;
 import com.solace.samples.requestreply.exception.RequestTimeoutException;
 import com.solace.samples.requestreply.exception.TransportException;
-import com.solace.samples.requestreply.latency.LatencyRecorder;
-import com.solace.samples.requestreply.latency.LatencySample;
 import com.solace.samples.requestreply.transport.FlowConsumer;
 import com.solace.samples.requestreply.transport.InboundMessage;
 import com.solace.samples.requestreply.transport.PersistentPublisher;
@@ -55,7 +52,6 @@ public class DefaultReplyingSolaceTemplate implements ReplyingSolaceTemplate, Au
     private final SolaceRequestReplyProperties props;
     private final PayloadCodec codec;
     private final ExecutorService completionExecutor;
-    private final LatencyRecorder latency;
 
     private final AtomicLong sequence = new AtomicLong();
     private final Map<String, Expression> replyPlaceholderExpressions = new java.util.LinkedHashMap<>();
@@ -68,8 +64,7 @@ public class DefaultReplyingSolaceTemplate implements ReplyingSolaceTemplate, Au
                                          CorrelationStore store,
                                          SolaceRequestReplyProperties props,
                                          PayloadCodec codec,
-                                         ExecutorService completionExecutor,
-                                         LatencyRecorder latency) {
+                                         ExecutorService completionExecutor) {
         this.session = session;
         this.replyEndpoint = replyEndpoint;
         this.publisher = publisher;
@@ -77,7 +72,6 @@ public class DefaultReplyingSolaceTemplate implements ReplyingSolaceTemplate, Au
         this.props = props;
         this.codec = codec;
         this.completionExecutor = completionExecutor;
-        this.latency = latency;
         props.getReply().getPerRequestPlaceholderExpressions().forEach((name, spel) -> {
             if (spel != null && !spel.isBlank()) {
                 replyPlaceholderExpressions.put(name, SPEL.parseExpression(spel));
@@ -171,25 +165,15 @@ public class DefaultReplyingSolaceTemplate implements ReplyingSolaceTemplate, Au
         RequestReplyFuture<RequestReplyMessage> future = new RequestReplyFuture<>(ticket.sendFuture());
 
         PendingRequest pending = new PendingRequest(correlationId, topic,
-                System.currentTimeMillis() + timeout.toMillis(), timeout.toMillis(), startNanos,
-                future);
+                System.currentTimeMillis() + timeout.toMillis(), timeout.toMillis(), future);
         // Register BEFORE publishing: a fast replier on the same broker can return a reply
         // before the publish acknowledgement arrives, and registering afterwards would drop it.
         store.register(pending);
 
         ticket.sendFuture().whenComplete((res, err) -> {
-            if (res != null) {
-                // Setting it directly on the same object the store owns, rather than a separate
-                // map keyed by correlation id, is what stops a confirmation that arrives after
-                // completion or expiry from leaking: this value dies with the request it belongs
-                // to instead of surviving in a container with no matching removal path.
-                pending.setConfirmNanos(res.confirmNanos());
-            } else if (err != null) {
+            if (err != null) {
                 // No point waiting out the timeout for a reply to a request that never landed.
-                store.remove(correlationId).ifPresent(p -> {
-                    latency.record(sampleFor(p, LatencySample.Outcome.PUBLISH_FAILURE, 0L, 0L));
-                    completeExceptionally(p, err);
-                });
+                store.remove(correlationId).ifPresent(p -> completeExceptionally(p, err));
             }
         });
 
@@ -229,60 +213,33 @@ public class DefaultReplyingSolaceTemplate implements ReplyingSolaceTemplate, Au
     // ---------------------------------------------------------------- receiving
 
     private void onReplyMessage(BytesXMLMessage msg) {
-        long dispatchDelayNanos = 0L;
         RequestReplyMessage reply = InboundMessage.toModel(msg);
         String correlationId = reply.getCorrelationId();
 
-
-        store.remove(correlationId).ifPresentOrElse(pending -> {
-            long total = System.nanoTime() - pending.getStartNanos();
-            long confirm = pending.getConfirmNanos();
-            long handler = parseLong(reply.getHeader(SolaceHeaders.HANDLER_NANOS));
-
-            LatencySample.Outcome outcome = reply.isError()
-                    ? LatencySample.Outcome.REMOTE_ERROR : LatencySample.Outcome.SUCCESS;
-            latency.record(new LatencySample(correlationId, outcome, total, confirm, handler,
-                    dispatchDelayNanos, reply.getSequence()));
-
-            // Off the dispatch thread: completing here would run every dependent stage of the
-            // caller's future on JCSMP's, stalling delivery for every other reply.
-            completionExecutor.execute(() -> {
-                if (reply.isError()) {
-                    pending.getFuture().completeExceptionally(
-                            new RemoteErrorException(correlationId, reply.getErrorMessage()));
-                } else {
-                    pending.getFuture().complete(reply);
-                }
-            });
-        }, () -> log.debug("Uncorrelated reply correlationId={} — already timed out, a duplicate, "
-                + "or addressed to a previous incarnation of this instance", correlationId));
+        store.remove(correlationId).ifPresentOrElse(pending ->
+                // Off the dispatch thread: completing here would run every dependent stage of
+                // the caller's future on JCSMP's, stalling delivery for every other reply.
+                completionExecutor.execute(() -> {
+                    if (reply.isError()) {
+                        pending.getFuture().completeExceptionally(
+                                new RemoteErrorException(correlationId, reply.getErrorMessage()));
+                    } else {
+                        pending.getFuture().complete(reply);
+                    }
+                }),
+                () -> log.debug("Uncorrelated reply correlationId={} — already timed out, a "
+                        + "duplicate, or addressed to a previous incarnation of this instance",
+                        correlationId));
     }
 
     private void expire(PendingRequest pending) {
-        long confirm = pending.getConfirmNanos();
-        latency.record(sampleFor(pending, LatencySample.Outcome.TIMEOUT, confirm, 0L));
         completeExceptionally(pending, new RequestTimeoutException(
                 pending.getCorrelationId(), pending.getRequestTopic(),
                 Duration.ofMillis(pending.getTimeoutMs())));
     }
 
-    private LatencySample sampleFor(PendingRequest p, LatencySample.Outcome outcome,
-                                    long confirmNanos, long handlerNanos) {
-        return new LatencySample(p.getCorrelationId(), outcome,
-                System.nanoTime() - p.getStartNanos(), confirmNanos, handlerNanos, 0L, null);
-    }
-
     private void completeExceptionally(PendingRequest pending, Throwable cause) {
         completionExecutor.execute(() -> pending.getFuture().completeExceptionally(cause));
-    }
-
-    private static long parseLong(String s) {
-        if (s == null) { return 0L; }
-        try {
-            return Long.parseLong(s.trim());
-        } catch (NumberFormatException e) {
-            return 0L;
-        }
     }
 
     /** Preserves the send future while mapping the reply payload. */

@@ -11,7 +11,7 @@
 
   <artifactId>solace-request-reply-core</artifactId>
   <name>Request/Reply Core</name>
-  <description>The reusable library: template, listener container, endpoint lifecycle, latency.</description>
+  <description>The reusable library: template, listener container, endpoint lifecycle.</description>
 
   <dependencies>
     <dependency>

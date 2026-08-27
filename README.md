@@ -9,8 +9,8 @@ is a train seat reservation service.
 
 **Contents:** [Overview](#1-overview) · [How the library is built](#2-how-the-library-is-built) ·
 [Core concepts](#3-core-concepts) · [Configuration](#4-configuration) ·
-[Coming from Spring for Kafka](#5-coming-from-spring-for-kafka) · [Latency test](#6-latency-test) ·
-[Endpoints](#7-endpoints) · [Known gaps and future work](#8-known-gaps-and-future-work)
+[Coming from Spring for Kafka](#5-coming-from-spring-for-kafka) ·
+[Endpoints](#6-endpoints) · [Known gaps and future work](#7-known-gaps-and-future-work)
 
 ---
 
@@ -34,11 +34,13 @@ This library is that missing layer. It is built to feel like Spring Kafka's requ
 on purpose — if you have used `ReplyingKafkaTemplate`, most of the API here will already look
 familiar. The rest of this document covers how the library is put together (§2), the concepts you
 need to use it correctly (§3), how to configure it (§4), how it compares to Spring Kafka in more
-detail (§5), and a few practical tools and caveats (§6–§8).
+detail (§5), and a few practical tools and caveats (§6–§7).
 
 To see it running rather than reading about it, the [booking-demo](booking-demo/README.md) module
 is a complete, guided walkthrough — starting a broker, building the demo, and making your first
-booking — built on top of this library.
+booking — built on top of this library. To use the library in your own application instead,
+[TUTORIAL.md](TUTORIAL.md) builds the same round trip up step by step, with the code for each
+piece.
 
 ---
 
@@ -55,7 +57,6 @@ The library lives in `solace-request-reply-core/`, organized by responsibility:
 | `endpoint/` | Creates and manages the actual Solace queues the library needs: the reply queue, the request queue, and the dead message queue. |
 | `transport/` | The lower-level plumbing underneath all of that: the Solace session itself, the component that publishes messages and tracks whether the broker confirmed them, and the component that receives messages off a queue. |
 | `listener/` | Finds every `@SolaceListener`-annotated method at startup and wires each one to its own queue and its own background thread pool. |
-| `latency/` | Records how long each stage of a round trip took and reports exact percentiles — what powers the latency test in §6. |
 
 ### Architecture
 
@@ -74,10 +75,6 @@ Replies go to **a separate queue for each requestor instance**. The `Completable
 a particular reply lives in the memory of one specific running process, and no other process can
 complete it on that process's behalf — so a reply has to be delivered to the one instance that is
 actually waiting, not shared out to whichever instance happens to be free.
-
-The request side deliberately uses a queue rather than a plain topic subscription. With a plain
-subscription, every replier instance would receive every request, and every one of them would act
-on it — in a booking system, one request would reserve a seat on every instance instead of one.
 
 ### An end-to-end flow example
 
@@ -184,8 +181,9 @@ subscription   rail/booking/seatReserve/reply/v1/nr/*/client-0
 reply-to       rail/booking/seatReserve/reply/v1/nr/12951/client-0
 ```
 
-That also means the train number is visible in the topic itself, so you can analyze latency per
-train without parsing any payload. Configure which values appear this way with
+That also means the train number is visible in the topic itself, so you can distinguish traffic per
+train — filter it, tap it during an incident — without parsing any payload. Configure which values
+appear this way with
 `reply.per-request-placeholders` and a matching `per-request-placeholder-expressions` entry. Listing
 a placeholder with no expression renders that topic level as `unknown` — the subscription still
 matches, so nothing breaks, but that piece of information is lost.
@@ -238,20 +236,44 @@ Three related but different clocks are running on every request:
   unacknowledged (or actively failed) request to a replier before giving up on it for good. Zero
   means "redeliver forever," which lets one malformed message loop indefinitely — the default is 3.
 
-By default, a handler that throws any exception is answered immediately with an error reply, and the
-request is considered done — right for a failure that will not change on a second attempt, like a
-validation error, but wrong for a transient one, like a database connection blip: that would turn a
-momentary hiccup into a booking the customer is told never happened.
+By default, when a handler throws anything other than `RetryableHandlerException`, the request is
+treated as **done, badly**: the exception becomes an error reply, and the message is acknowledged —
+the broker will never redeliver it.
 
-For a failure you want retried, throw `RetryableHandlerException` instead. This settles the request
-as `FAILED` rather than acknowledging it — an *active* request to the broker to redeliver, which is
-what actually triggers another attempt (a message that is merely left unacknowledged only
-redelivers when the connection drops and reconnects, not on demand). This does not make the
-original caller's call succeed any sooner — its own `request.timeout` still runs out regardless of
-how many redelivery attempts follow — but it does mean the underlying work is not silently turned
-into a permanent failure the moment a transient error is hit. It is still bounded by the request's
-own TTL: a message can expire off the queue mid-retry before `max-redelivery` is even reached, so
-raise `request.timeout` if a handler genuinely needs more retry budget than one fast attempt gives it.
+- **What gets built as the reply:** if a `SolaceListenerErrorHandler` bean is configured for this
+  listener, it runs first and can return a value to publish as a normal-looking reply instead. If
+  there isn't one — or it rethrows — the reply carries the exception's own message, flagged as an
+  error.
+- **What the caller sees:** its `CompletableFuture` fails immediately with `RemoteErrorException`,
+  carrying that message. This is a deliberate fail-fast: the requestor learns about the failure
+  right away instead of waiting out its own `request.timeout` for a reply that was never coming.
+- **The side effect:** because the message is acknowledged, this is final. There is no redelivery,
+  no second attempt — right for a failure that a retry can't fix, like a validation error or a
+  business rule violation. Wrong for one that might succeed a moment later, like a database
+  connection blip: that turns a momentary hiccup into a booking the customer is told never happened.
+
+**For a failure you want retried, throw `RetryableHandlerException` instead.** This skips the reply
+and the error handler entirely, and settles the message `FAILED` rather than acknowledging it — an
+*active* request to the broker to redeliver, as opposed to leaving the message unacknowledged, which
+only redelivers if the connection drops and reconnects, not on demand. The broker retries the
+handler up to `replier.provision.max-redelivery` times before giving up and moving the message to
+the dead message queue.
+
+What that does *not* do:
+- **It doesn't buy the caller more time.** The original `CompletableFuture` still expires on its own
+  `request.timeout`, no matter how many redeliveries happen behind it — this only helps if a retry
+  succeeds before that clock runs out.
+- **It doesn't bypass the message's own TTL.** By default the message TTL equals `request.timeout`,
+  so it can expire off the queue mid-retry before `max-redelivery` is even reached. Raise
+  `request.timeout` if a handler genuinely needs more retry budget than one fast attempt gives it.
+
+| | Default (any other exception) | `RetryableHandlerException` |
+|---|---|---|
+| Settlement | Acknowledged — done | `FAILED` — active redelivery request |
+| Reply published? | Yes (via error handler, or a generic error) | No |
+| Caller sees | `RemoteErrorException`, immediately | Nothing, until either a retry succeeds or `request.timeout` elapses |
+| Redelivery? | Never | Up to `max-redelivery`, then DMQ |
+| Use for | Failures a retry can't fix (validation, business rules) | Failures that might succeed on retry (transient errors) |
 
 Replies carry a TTL too (`replier.reply-ttl`, defaulting to `request.timeout`), for the same reason:
 a reply is only useful to the one requestor instance whose future is still waiting, and past that
@@ -268,13 +290,17 @@ makes guaranteed delivery actually guarantee anything.
 `@SolaceListener(ackMode = ...)` chooses who decides a request is done, and when: `CLIENT` (the
 default) or `AUTO`.
 
-`CLIENT`: the library acknowledges the request itself, only once the reply has been published *and*
-the broker has confirmed it is safely stored. A crash before that point produces a redelivery
-instead of a silently lost request — the broker's copy stays authoritative until the reply is
-definitely somewhere durable. A handler that throws `RetryableHandlerException`, or a reply that
-fails to publish, gets an active redelivery the same way, as described in §3.4.
+**`CLIENT`** — the library acknowledges the request itself, and only after two things have both
+happened: the reply has been published, *and* the broker has confirmed it is safely stored.
 
-`AUTO`: JCSMP acknowledges on your behalf, the instant the handler method returns — confirmed
+- **If the process crashes before that point,** the broker's copy is still there, unacknowledged,
+  so it gets redelivered instead of silently lost.
+- **The same active-redelivery mechanism covers two more cases from [§3.4](#34-ttls-redeliveries-and-timeouts):**
+  a handler that throws `RetryableHandlerException`, and a reply that fails to publish. Neither
+  leaves the request merely unacknowledged — both actively settle it `FAILED`, which is what
+  triggers redelivery on demand rather than only on the next reconnect.
+
+**`AUTO`** — JCSMP acknowledges on your behalf, the instant the handler method returns — confirmed
 against a live broker, not just assumed from documentation — regardless of what that handler
 actually did. That has two consequences, not one:
 
@@ -288,8 +314,13 @@ actually did. That has two consequences, not one:
   cannot force a redelivery under `AUTO`: JCSMP has already decided to acknowledge the message by
   the time either of those runs, and nothing the handler does can change that afterward.
 
-`AUTO` fits a fast handler that sends no reply and can tolerate an occasional failure disappearing
-silently. `CLIENT` is the right choice for everything else, including anything that replies.
+| | `CLIENT` (default) | `AUTO` |
+|---|---|---|
+| Who acknowledges, and when | This library, after the reply is published *and* confirmed | JCSMP, the instant the handler method returns |
+| Handler runs on | This listener's own thread pool | JCSMP's shared dispatch thread — blocks every other listener while it runs |
+| Crash before ack | Redelivered | Already acknowledged — lost |
+| `RetryableHandlerException` / failed reply-publish | Actively redelivered ([§3.4](#34-ttls-redeliveries-and-timeouts)) | No effect — the message is already acknowledged |
+| Best for | Anything that replies, or needs a real failure path | A fast handler with no reply that can tolerate an occasional silent loss |
 
 ### 3.6 Dead message queues
 
@@ -310,11 +341,13 @@ solace:
       dmq-eligible: true          # flag on published replies
 ```
 
-There is one shared DMQ by default, since every queue already points at it — using a *different*
-one is a broker-side setting (`deadMsgQueue` on the source queue), not something this client library
-can set, so `dmq.name` only affects what this library provisions and reports on, not where messages
-actually go; changing that routing needs a direct SEMP call against the broker, and a mismatch
-between the two logs a warning at startup rather than failing silently.
+- **There is one shared DMQ by default** — every queue already points at it out of the box.
+- **Routing to a different DMQ is a broker-side setting** (`deadMsgQueue` on the source queue), not
+  something this client library can set. `dmq.name` only controls what this library provisions and
+  reports on — not where messages actually go. Changing the real routing needs a direct SEMP call
+  against the broker.
+- **A mismatch between the two surfaces as a startup warning**, not silence — so if you do repoint
+  the routing via SEMP, that's where to check it took effect.
 
 What actually ends up there is less obvious than it looks, and worth knowing before you go looking
 for a message that isn't:
@@ -328,16 +361,17 @@ for a message that isn't:
 | Handler throws `RetryableHandlerException` | after `max-redelivery` redeliveries — **yes**; before that, redelivered, not yet |
 | Handler throws anything else | **no** — that becomes an error reply, and the request is acknowledged |
 
-The second row is the one worth sitting with, and it's confirmed against a live broker rather than
-assumed: a message delivered to a client and left unacknowledged — exactly what happens while it
-waits its turn in a busy handler pool — is still dead-lettered by the broker at its TTL deadline
-regardless. The broker does not check delivery state before discarding its own copy. That means a
-handler can run to completion and produce a real effect (a reserved seat) for a request that is
-*simultaneously* sitting in the DMQ looking exactly like one that was never processed at all — **a
-DMQ entry is not proof the work never happened.** Anything that replays a DMQ'd message — an
-operator, a script — has to reuse the *original* correlation id for the idempotency guard in
-[§3.1](#31-correlation-id) to recognize it as a repeat; assigning a fresh id will not be caught, and
-produces a second, genuine booking for one that already succeeded.
+The second row is the one worth sitting with. Confirmed against a live broker, not assumed: a
+message delivered to a client and left unacknowledged — exactly what happens while it waits its turn
+in a busy handler pool — is still dead-lettered at its TTL deadline regardless. The broker does not
+check delivery state before discarding its own copy.
+
+- **A handler can finish and produce a real effect** (a reserved seat) for a request that is
+  *simultaneously* sitting in the DMQ, looking exactly like one that was never processed at all —
+  **a DMQ entry is not proof the work never happened.**
+- **Replaying a DMQ'd message must reuse its original correlation id.** That's what the idempotency
+  guard in [§3.1](#31-correlation-id) needs to recognize it as a repeat. Assigning a fresh id will
+  not be caught, and produces a second, genuine booking for one that already succeeded.
 
 One broker-version difference affects all of this: on **10.25.10 and later**, *all* messages removed
 from a queue go to the DMQ by default; on **10.25.9 and earlier**, only messages the publisher
@@ -351,7 +385,7 @@ curl -s -u admin:admin \
   'http://localhost:8085/SEMP/v2/monitor/msgVpns/default/queues/%23DEAD_MSG_QUEUE/msgs' | jq
 ```
 
-`GET /api/diagnostics/endpoints` (§7) also reports a `dmq` block with `configuredEnabled` and
+`GET /api/diagnostics/endpoints` (§6) also reports a `dmq` block with `configuredEnabled` and
 `established` reported separately, since dead-lettering can be switched on in configuration and
 still be inert — a queue that failed to provision means the broker falls back to deleting.
 
@@ -401,15 +435,20 @@ A handful of settings are worth deciding deliberately rather than leaving at the
 | `dmq.enabled` | `true` | Turning it off restores silent discard of failed messages — see [§3.6](#36-dead-message-queues). |
 | `replier.reply-ttl` | follows `request.timeout` | Set `0s` to keep replies forever, at the cost of orphaned queues growing — see [§3.4](#34-ttls-redeliveries-and-timeouts). |
 
-`replier.provision.mode` and `reply.provision-mode` each accept two values, `CREATE_IF_MISSING`
-(the default) and `OFF` — not three. A "validate but never create" mode looks appealing, but JCSMP
-has no such call: `provision()` creates a missing endpoint unconditionally, flag or no flag —
-verified against a live broker; see [spike/README.md](spike/README.md). Leaving creation on is safe
-regardless, because configuration drift is reported rather than silently accepted: if a queue exists
-with different properties than requested, JCSMP raises an error naming exactly which property
-differs, whether or not the queue had to be created in the first place. Use `OFF` on a message VPN
-whose client profile forbids creating endpoints — the queue then needs to be provisioned out of band
-in advance.
+`replier.provision.mode` and `reply.provision-mode` each accept two values:
+
+- **`CREATE_IF_MISSING`** (the default) — creates the queue if it doesn't already exist. If it does
+  exist with different properties than requested, JCSMP raises an error naming exactly which
+  property differs, rather than silently accepting the drift or silently overwriting it.
+- **`OFF`** — never creates or reconciles anything; the queue must already exist. Use this on a
+  message VPN whose client profile forbids creating endpoints, and provision the queue out of band
+  first.
+
+There's no third "validate but never create" mode, because JCSMP itself has none to offer:
+`provision()` creates a missing endpoint unconditionally, flag or no flag — verified against a live
+broker, not assumed from documentation; see [spike/README.md](spike/README.md). That's what makes
+`CREATE_IF_MISSING` safe to leave on even against an already-provisioned queue — the drift check
+above, not avoiding the creation call, is what actually protects you.
 
 Three places to look for anything not covered here:
 
@@ -446,80 +485,11 @@ Three places to look for anything not covered here:
 | Dead letters | a client-side recoverer republishes to a `.DLT` topic | the broker moves messages to a dead message queue itself, with no client code involved. On by default here; see [§3.6](#36-dead-message-queues). |
 | Queue browsing | not applicable | a queue can be browsed non-destructively, which is how you inspect the DMQ. |
 | Acknowledgement | `AckMode.RECORD` and friends layer commit-after-processing over a raw `enable.auto.commit` that is really commit-on-a-timer | `@SolaceListener(ackMode = "CLIENT")` (the default) acks after processing, the same idea as `AckMode.RECORD`; `AUTO` hands acking to JCSMP itself and gives up more than the name suggests — see [§3.5](#35-acknowledgements). |
-| `@SendTo` destinations | supports SpEL, `#{...}` and `!{...}`, to compute a reply topic from the record | not supported, deliberately — see [§8](#8-known-gaps-and-future-work). |
+| `@SendTo` destinations | supports SpEL, `#{...}` and `!{...}`, to compute a reply topic from the record | not supported, deliberately — see [§7](#7-known-gaps-and-future-work). |
 
 ---
 
-## 6. Latency test
-
-A single command runs a test, prints a report, and exits. It needs no metrics backend, and it's part
-of the `booking-demo` module — it exercises this library the same way any real caller would.
-
-```bash
-java -jar booking-demo/target/booking-demo-0.1.0-SNAPSHOT.jar \
-  --spring.profiles.active=loadtest \
-  --loadtest.count=4000 --loadtest.concurrency=48 --loadtest.warmup=300
-```
-
-```
-Seat reservation latency
-4,000 requests · concurrency 48 · CLOSED_LOOP · 300 warmup discarded
-completed in 14.1s · 283 req/s
-
-OUTCOMES
-  success                 4,000  100.00%
-  timeout                     0    0.00%
-
-TOTAL ROUND TRIP
-       p50       8.8 ms
-       p99      24.6 ms
-     p99.9      33.9 ms
-       max     271.1 ms
-
-DISTRIBUTION
-      4 -     8 ms     1,181  █████████████████▎
-      8 -    16 ms     2,323  ██████████████████████████████████
-     16 -    32 ms       490  ███████▏
-     32 -    64 ms         3  ▏
-
-SEGMENTS                      p50        p99
-  publish confirm          4.3 ms    13.5 ms
-  queue dwell              4.3 ms    13.0 ms
-  handler                  0.1 ms     0.3 ms
-  dispatch delay           0.0 ms     0.0 ms
-
-ORDERING
-  sequence gaps                   0   no message loss
-  out-of-order                    0   in order
-```
-
-The percentiles are exact rather than estimated from histogram buckets — a test run is bounded, so
-every sample can be kept. 100,000 measurements is 800 KB and sorts in about ten milliseconds.
-
-The segment breakdown is the part that tells you what to do next. A p99 of 24.6 ms on its own does
-not say much; knowing that 13 ms of it was queue dwell suggests adding replier instances, whereas
-the same figure under `handler` would point at the database instead. Buckets are on a log scale,
-doubling each row, because latency distributions have long tails and linear buckets put almost
-everything in one row.
-
-### Closed loop and open loop
-
-The default mode keeps a fixed number of requests in flight and waits for each reply. When the
-system slows down, the generator sends fewer requests, so slow periods are under-sampled and the
-tail looks better than it really is — this measures service time at a given concurrency, not
-latency at a given arrival rate.
-
-For the latter, use open loop mode, which sends at a fixed rate regardless of replies:
-
-```bash
---loadtest.mode=OPEN_LOOP --loadtest.rate=500
-```
-
-The report always states which mode produced it.
-
----
-
-## 7. Endpoints
+## 6. Endpoints
 
 These are the demo application's REST endpoints — a way to exercise the library over HTTP — not
 part of the library's own API surface, which is `ReplyingSolaceTemplate` and `@SolaceListener`.
@@ -530,12 +500,11 @@ part of the library's own API surface, which is `ReplyingSolaceTemplate` and `@S
 | `POST /api/bookings` with `"simulate"` | `timeout`, `remote-error` or `slow-handler`, to reproduce each failure mode |
 | `GET /api/diagnostics/endpoints` | what was actually provisioned, rather than what was configured |
 | `GET /api/diagnostics/reply-path` | whether this instance's reply path is bound and subscribed |
-| `POST /api/latency/start` and `POST /api/latency/report` | exact percentiles over ad-hoc traffic |
 | `GET /actuator/health` | session and endpoint state |
 
 ---
 
-## 8. Known gaps and future work
+## 7. Known gaps and future work
 
 Honest limitations, by design or not yet addressed:
 

@@ -7,9 +7,11 @@ you can reproduce here with a `curl` and read back in a log line.
 This document is a walkthrough. Follow it top to bottom and each step builds on the one before it.
 Every command and every output below was captured from an actual run, not written from memory.
 
-For the library's design and configuration reference, see the [root README](../README.md).
+For the library's design and configuration reference, see the [root README](../README.md). To build
+your own service on top of the library instead of exploring this one, see
+[../TUTORIAL.md](../TUTORIAL.md).
 
-**Time required:** about 15 minutes for steps 1–8, another 10 for steps 9–12.
+**Time required:** about 15 minutes for steps 1–8, another 10 for steps 9–10.
 
 ---
 
@@ -23,7 +25,6 @@ For the library's design and configuration reference, see the [root README](../R
 | [6–7](#step-6-the-two-stage-future-publish-versus-reply) | The two-stage future: telling a publish failure apart from an unanswered request |
 | [8](#step-8-nothing-is-lost-when-a-request-expires) | Dead-lettering: an expired request kept for inspection instead of deleted |
 | [9–10](#step-9-split-the-two-sides-into-separate-processes) | Splitting requestor and replier, then scaling repliers out |
-| [11](#step-11-measure-latency) | Exact latency percentiles with a segment breakdown |
 
 
 ## How the pieces fit together
@@ -176,8 +177,8 @@ The requestor subscribes **once**, with a wildcard in the train-number position,
 **concrete** reply-to per request. The replier never has to know how reply topics are structured —
 it only echoes what it was given.
 
-The payoff is that the train number is visible in the topic, so you can measure latency per train,
-or tap one train during an incident, without parsing payloads.
+The payoff is that the train number is visible in the topic, so you can distinguish traffic per
+train, or tap one train during an incident, without parsing payloads.
 
 #### How that is configured
 
@@ -518,75 +519,6 @@ work the moment its flow bound.
 
 ---
 
-## Step 11: Measure latency
-
-One command runs a test, prints a report, and exits. No metrics backend required.
-
-```bash
-java -jar booking-demo/target/booking-demo-0.1.0-SNAPSHOT.jar \
-  --spring.profiles.active=loadtest --solace.java.client-name=loadtest-1 \
-  --loadtest.count=2000 --loadtest.concurrency=32 --loadtest.warmup=200
-```
-
-```
-Seat reservation latency
-2,000 requests · concurrency 32 · CLOSED_LOOP · 200 warmup discarded
-completed in 4.8s · 414 req/s
-
-OUTCOMES
-  success                 2,000  100.00%
-  timeout                     0    0.00%
-  remote_error                0    0.00%
-  publish_failure             0    0.00%
-
-TOTAL ROUND TRIP
-       p50       7.2 ms
-       p99      10.7 ms
-     p99.9      37.2 ms
-       max      43.2 ms
-
-DISTRIBUTION
-      4 -     8 ms     1,703  ██████████████████████████████████
-      8 -    16 ms       291  █████▊
-     16 -    32 ms         3  ▏
-     32 -    64 ms         3  ▏
-
-SEGMENTS                      p50        p99
-  publish confirm          3.5 ms     5.6 ms
-  queue dwell              3.5 ms     5.8 ms
-  handler                  0.1 ms     0.2 ms
-  dispatch delay           0.0 ms     0.0 ms
-
-ORDERING
-  sequence gaps                   0   no message loss
-  out-of-order                    0   in order
-```
-
-The **segment breakdown** is the part that tells you what to do next. A p99 of 10.7 ms says little on
-its own; knowing that 5.8 ms of it was queue dwell points at adding repliers, whereas the same figure
-under `handler` would point at the database.
-
-Percentiles are exact, not interpolated from buckets — a bounded test run means every sample can be
-kept. Buckets double each row because latency distributions have long tails.
-
-The report names its mode, because it changes the meaning. `CLOSED_LOOP` keeps a fixed number of
-requests in flight, so a slowdown makes the generator send *less* and the tail flatters reality. For
-latency at a fixed arrival rate:
-
-```bash
---loadtest.mode=OPEN_LOOP --loadtest.rate=500
-```
-
-You can also measure ad-hoc traffic against a running instance, using the same report code:
-
-```bash
-curl -s -X POST http://localhost:8091/api/latency/start
-# ... drive whatever traffic you like ...
-curl -s -X POST "http://localhost:8091/api/latency/report?concurrency=1" | jq
-```
-
----
-
 ## Cleanup
 
 ```bash
@@ -609,14 +541,14 @@ The entire surface used by this demo is four things:
 
 | Library API | Used by | Role |
 |---|---|---|
-| `ReplyingSolaceTemplate.sendAndReceive(...)` | [BookingController](src/main/java/com/solace/samples/booking/web/BookingController.java), [LoadTestRunner](src/main/java/com/solace/samples/booking/loadtest/LoadTestRunner.java) | Requestor side. Returns a `RequestReplyFuture`. |
+| `ReplyingSolaceTemplate.sendAndReceive(...)` | [BookingController](src/main/java/com/solace/samples/booking/web/BookingController.java) | Requestor side. Returns a `RequestReplyFuture`. |
 | `RequestReplyFuture.getSendFuture()` | [BookingController](src/main/java/com/solace/samples/booking/web/BookingController.java) | Separates "the broker took it" from "somebody answered". |
 | `@SolaceListener` + `@SendTo` | [SeatReservationListener](src/main/java/com/solace/samples/booking/replier/SeatReservationListener.java) | Replier side. Bare `@SendTo` replies to the request's reply-to. |
 | `SolaceHeaders.CORRELATION_ID` | [SeatReservationListener](src/main/java/com/solace/samples/booking/replier/SeatReservationListener.java) | The idempotency key, a native SMF field. |
 
 Everything else — provisioning the request queue, creating and re-establishing the reply endpoint,
-correlating replies, timing out and evicting abandoned requests, measuring segments, acknowledging
-after the reply is spooled — is the library's job and needs no application code.
+correlating replies, timing out and evicting abandoned requests, acknowledging after the reply is
+spooled — is the library's job and needs no application code.
 
 If you have used Spring Kafka, the shapes are deliberately familiar:
 
@@ -652,12 +584,9 @@ src/main/java/com/solace/samples/booking/
   web/
     BookingController.java        REST facade; the two-stage future and the failure taxonomy
     DiagnosticsController.java    what was provisioned; reply-path probe
-    LoadTestController.java       ad-hoc latency start/report
   replier/
     SeatReservationListener.java  @SolaceListener + @SendTo
     SeatInventoryService.java     idempotency by correlation id; per-row locking
-  loadtest/
-    LoadTestRunner.java           standalone harness; closed and open loop
 src/main/resources/application.yml   the worked configuration, commented throughout
 ```
 

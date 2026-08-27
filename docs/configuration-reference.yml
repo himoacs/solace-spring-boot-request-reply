@@ -282,11 +282,3 @@ booking:
   topics:
     request-pattern: "rail/booking/seatReserve/request/v1/{zone}/{trainNo}"
     request-subscription: "rail/booking/seatReserve/request/v1/>"
-
-# Used by the standalone latency test, under --spring.profiles.active=loadtest.
-loadtest:
-  count: 5000
-  concurrency: 32
-  warmup: 200
-  mode: CLOSED_LOOP                      # CLOSED_LOOP | OPEN_LOOP
-  rate: 1000                             # requests per second, OPEN_LOOP only
