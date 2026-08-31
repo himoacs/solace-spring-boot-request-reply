@@ -87,6 +87,34 @@ solace:
       # the same. Inert unless the DMQ exists -- see the dmq block below.
       dmq-eligible: true
 
+      # Caps concurrent in-flight sendAndReceive calls on this instance. 0 (the
+      # default) is unbounded, matching prior behaviour.
+      #
+      # Without a cap, a traffic burst or a stalled replier grows the
+      # correlation store to roughly arrivalRate * timeout entries before the
+      # timeout reaper below catches up -- accepted silently, with no signal to
+      # the caller that it should slow down. Setting this turns that into a
+      # fast RequestBackpressureException the moment the cap is hit.
+      max-pending: 0
+
+      # How often the timeout reaper sweeps the correlation store for expired
+      # requests. Lower values fail expired requests sooner, at the cost of
+      # copying the store's pending entries more often.
+      reaper-sweep-interval: 100ms
+
+      # How stale the reaper's last successful sweep may get before the reply
+      # path (see reply.enabled below) reports itself DOWN. Should be a small
+      # multiple of reaper-sweep-interval above.
+      #
+      # The reaper runs on a scheduleWithFixedDelay task, whose documented
+      # behaviour is to stop running -- forever, silently -- the first time it
+      # throws. From that moment every future request leaks its
+      # CompletableFuture and its correlation-store entry for the life of the
+      # process. This threshold is what turns that failure into something a
+      # readiness probe can see, rather than something a memory profile
+      # eventually reveals.
+      reaper-max-staleness: 5s
+
     # -------------------------------------------------- this instance's replies
     reply:
 
@@ -203,6 +231,39 @@ solace:
       # Flows bound to the queue by this instance, and the size of the handler
       # thread pool.
       concurrency: 4
+
+      # Bounds the in-process handoff between this listener's flow(s) and its
+      # handler pool, for CLIENT-ack listeners (AUTO-ack runs the handler
+      # inline and never touches this pool at all).
+      #
+      # Executors.newFixedThreadPool -- what backed this pool unconditionally
+      # before this setting existed -- queues onto an UNBOUNDED queue. A
+      # handler that cannot keep up with broker delivery did not slow delivery
+      # down at all: every request kept landing in this process's heap as a
+      # queued task holding the raw message, growing without limit.
+      backpressure:
+        enabled: true
+
+        # <= 0 resolves to 2 * concurrency for this listener.
+        queue-capacity: 0
+
+        # <= 0 resolves to queue-capacity -- pause once the buffer is full.
+        # Once the handoff queue reaches this depth, this listener's flow(s)
+        # are paused (FlowReceiver.stop()) so the backlog accumulates on the
+        # broker's durable queue instead -- visible, monitored, and already
+        # governed by provision.max-redelivery and the DMQ below -- rather
+        # than invisibly in this process's memory.
+        pause-at-queue-depth: 0
+
+        # <= 0 resolves to half of the resolved queue-capacity. Flow delivery
+        # resumes once the backlog drains to this depth.
+        resume-at-queue-depth: 0
+
+        # A message that still arrives after the queue is genuinely full (the
+        # broker's in-flight window did not drain in time to see the pause)
+        # is settled FAILED rather than accepted unconditionally, so it
+        # redelivers -- subject to provision.max-redelivery and the DMQ --
+        # instead of piling up regardless.
 
       provision:
         # CREATE_IF_MISSING creates the queue when absent and fails startup if an

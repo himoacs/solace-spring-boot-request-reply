@@ -66,4 +66,27 @@ public interface ReplyingSolaceTemplate {
      * </pre>
      */
     String replyTopicPattern();
+
+    /**
+     * Requests currently registered on this instance and awaiting a reply.
+     *
+     * <p>Bounded by {@code solace.request-reply.request.max-pending} when it is set; otherwise
+     * bounded only by {@code request.timeout} and however fast requests arrive, so a sustained
+     * climb here — independent of traffic settling back down — is the first sign of a leak, not
+     * something to notice only once memory runs out.
+     *
+     * @return the pending count, or {@code -1} if this implementation does not track one
+     */
+    default int pendingRequestCount() { return -1; }
+
+    /**
+     * Milliseconds since the timeout reaper's last sweep attempt, or {@code -1} if this
+     * implementation has no reaper or has not started one yet.
+     *
+     * <p>A value that keeps growing instead of staying near the configured sweep interval means
+     * the reaper has stopped running — every unanswered request from that moment leaks its
+     * future and its correlation-store entry for the rest of the process's life. Wire this into a
+     * health check or an alert rather than discovering it from a memory profile.
+     */
+    default long reaperLastSweepAgeMillis() { return -1; }
 }

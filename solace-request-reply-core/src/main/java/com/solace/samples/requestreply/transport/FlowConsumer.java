@@ -37,6 +37,7 @@ public class FlowConsumer implements AutoCloseable {
     private final String name;
 
     private volatile FlowReceiver flow;
+    private volatile boolean paused;
 
     public FlowConsumer(SolaceSession session, Queue queue, String name,
                         boolean clientAck, Consumer<BytesXMLMessage> handler) {
@@ -49,6 +50,7 @@ public class FlowConsumer implements AutoCloseable {
 
     public synchronized void start() {
         if (flow != null) { return; }
+        paused = false;
         try {
             ConsumerFlowProperties fp = new ConsumerFlowProperties();
             fp.setEndpoint(queue);
@@ -80,6 +82,41 @@ public class FlowConsumer implements AutoCloseable {
     }
 
     public boolean isBound() { return flow != null; }
+
+    /**
+     * Stops delivery on this flow without unbinding it — consumer-side backpressure, not
+     * shutdown. The flow stays bound and any message already in flight to {@code handler} is
+     * unaffected; the broker simply stops pushing more until {@link #resume()}.
+     */
+    public synchronized void pause() {
+        FlowReceiver f = flow;
+        if (f == null || paused) { return; }
+        try {
+            // Unlike start(), stop() declares no checked exception -- but the flow can still be
+            // torn down concurrently by a reconnect, so guard against that the same way
+            // acknowledge() does elsewhere in this library, rather than assuming it cannot happen.
+            f.stop();
+            paused = true;
+        } catch (RuntimeException e) {
+            log.warn("Could not pause flow '{}'; the broker will keep delivering at full window "
+                    + "until the next attempt succeeds", name, e);
+        }
+    }
+
+    /** Resumes delivery after {@link #pause()}. A no-op if the flow was never paused. */
+    public synchronized void resume() {
+        FlowReceiver f = flow;
+        if (f == null || !paused) { return; }
+        try {
+            f.start();
+            paused = false;
+        } catch (JCSMPException e) {
+            log.warn("Could not resume flow '{}'; it will stay paused until the next reconnect "
+                    + "rebinds it, or the next resume attempt succeeds", name, e);
+        }
+    }
+
+    public boolean isPaused() { return paused; }
 
     @Override
     public synchronized void close() {

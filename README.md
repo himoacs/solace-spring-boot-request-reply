@@ -130,6 +130,11 @@ seat reserved twice — for a small amount of code. See `SeatInventoryService.re
 for a worked example; in a real service, the reservation and that record belong in one database
 transaction with a unique constraint on the correlation id.
 
+`request.sequence-numbers` (default `true`) stamps a second, monotonic value on top of the
+correlation id — a plain counter, not a substitute for it. Because replies genuinely can arrive out
+of order, a gap or a reorder in that counter is what a load test or a diagnostic tool checks for, to
+tell "reordered" apart from "lost" without needing the correlation id's own uniqueness guarantee.
+
 ### 3.2 Topics, wildcards, and topic-to-queue mapping
 
 A **topic** is just a string that a message is published to — a name, not an object that has to be
@@ -188,6 +193,10 @@ appear this way with
 a placeholder with no expression renders that topic level as `unknown` — the subscription still
 matches, so nothing breaks, but that piece of information is lost.
 
+Not every placeholder needs to vary per request, though. `reply.placeholders` is the static
+counterpart — a fixed value, such as `zone: nr`, resolved once at startup and substituted into every
+reply topic and the reply queue name alike, rather than re-evaluated against each request's payload.
+
 ### 3.3 Request queues vs. reply queues
 
 | | Request queue | Reply queue |
@@ -196,6 +205,17 @@ matches, so nothing breaks, but that piece of information is lost.
 | Who can bind to it | many repliers at once (non-exclusive) | exactly one flow at a time (exclusive) |
 | How work is distributed | the broker load-balances across whichever repliers are connected | not applicable — every message is addressed to one specific instance |
 | Why | any replier can answer any request, so this is what makes horizontal scale-out safe | the waiting `CompletableFuture` lives in one process's memory, so the reply has to reach that exact process |
+
+The request queue's "many repliers at once" behavior is `replier.access-type: NON_EXCLUSIVE`, the
+default and what scale-out needs. Setting it to `EXCLUSIVE` flips that: only one bound flow is ever
+active at a time, and every other instance sits as an idle standby the broker fails over to only if
+the active one disconnects — a hot/cold pair rather than a load-balanced pool.
+
+Each queue also has a spool quota — `reply.quota-mb` (default `100`) for the reply queue,
+`replier.provision.quota-mb` (default `5000`) for the request queue — capping how much unconsumed
+data the broker will hold for it before rejecting further publishes. Size these for how large a
+backlog you expect to tolerate, not just steady-state traffic: a stalled replier or a slow requestor
+can spool a real backlog before either timeout or redelivery limits catch up.
 
 The reply queue is durable (it survives a broker restart) and named after the requestor instance —
 `q….reply.{instanceId}` — which makes `reply.instance-id` a value worth setting deliberately rather
@@ -216,6 +236,12 @@ The resolved value is always logged at startup, so it is never a guess:
 Reply endpoint identity: instanceId=pod-0 queue=q.rail.booking.reply.pod-0
 ```
 
+On startup, `waitForReplyEndpoint()` blocks for up to `reply.wait-for-endpoint` (default `10s`) for
+the reply queue to be provisioned, subscribed, and bound before letting the application proceed —
+the analogue of Spring Kafka's `waitForAssignment`. Publishing a request before that window closes
+would have nowhere for the reply to land; a warning is logged, not a startup failure, if the endpoint
+still isn't ready when the timeout elapses, since a broker under load may simply need longer.
+
 **A replier-only process should not have a reply queue at all.** It only ever consumes the shared
 request queue and publishes each reply to the topic the request asked for — it is never itself the
 target of a reply. Set `reply.enabled: false` on such a process; this removes the reply queue, the
@@ -235,6 +261,18 @@ Three related but different clocks are running on every request:
 - **`replier.provision.max-redelivery`** bounds how many times the broker will hand an
   unacknowledged (or actively failed) request to a replier before giving up on it for good. Zero
   means "redeliver forever," which lets one malformed message loop indefinitely — the default is 3.
+
+Two more request-queue settings govern what happens at each of those clocks' edges:
+
+- **`replier.provision.respects-ttl`** (default `true`) is what makes the request's own TTL, above,
+  actually take effect on the request queue. Turning it off has the broker ignore the TTL the
+  publisher set, so a request can sit on the queue past the deadline the requestor already gave up
+  at — the queue equivalent of `request.ttl-matches-timeout` being pointless without this also on.
+- **`replier.provision.discard-notify-sender`** (default `true`) has the broker tell the *publisher*
+  when one of its messages is discarded from this queue — expired or over `max-redelivery` — rather
+  than only ever surfacing as a plain client-side timeout. This is what lets a requestor eventually
+  distinguish "discarded" from "still might arrive" instead of always waiting out the full
+  `request.timeout` either way.
 
 By default, when a handler throws anything other than `RetryableHandlerException`, the request is
 treated as **done, badly**: the exception becomes an error reply, and the message is acknowledged —
@@ -348,6 +386,14 @@ solace:
   against the broker.
 - **A mismatch between the two surfaces as a startup warning**, not silence — so if you do repoint
   the routing via SEMP, that's where to check it took effect.
+- **`dmq.provision`** (default `true`) creates the DMQ at startup if it's missing — turn it off if
+  it's provisioned out of band, in which case nothing is verified, because a client without
+  management visibility cannot tell "missing" from "just not visible to me."
+- **`dmq.quota-mb`** (default `1000`) is the DMQ's own spool quota, independent of the request and
+  reply queues' quotas in [§3.3](#33-request-queues-vs-reply-queues). It is provisioned with
+  `respectsMsgTTL=false` regardless of any other setting — these messages are here *because* they
+  expired, and honoring their TTL again would expire them straight back out of the one place they're
+  meant to survive.
 
 What actually ends up there is less obvious than it looks, and worth knowing before you go looking
 for a message that isn't:
@@ -389,6 +435,70 @@ curl -s -u admin:admin \
 `established` reported separately, since dead-lettering can be switched on in configuration and
 still be inert — a queue that failed to provision means the broker falls back to deleting.
 
+### 3.7 Backpressure
+
+Two independent problems, one on each side of a request, both about what happens when work arrives
+faster than it can be drained.
+
+**Requestor side: unbounded in-flight requests.** Every `sendAndReceive` call registers a
+`CompletableFuture` in an in-memory correlation store, keyed by correlation id, until a reply
+arrives or `request.timeout` elapses — enforced by a background reaper sweeping the store every
+`request.reaper-sweep-interval` (default `100ms`). Left uncapped, a traffic burst or a stalled
+replier grows that store to roughly `arrivalRate × timeout` entries before the reaper catches up —
+accepted silently, with no signal to the caller that it should slow down.
+
+`request.max-pending` (default `0`, unbounded) caps how many requests this instance will have in
+flight at once. Past the cap, `sendAndReceive` fails immediately with `RequestBackpressureException`
+instead of registering — a fast, typed signal to retry or shed load, rather than an ever-growing map
+of futures each waiting on a reply that may never come.
+
+**Replier side: an unbounded handler queue.** A `CLIENT`-ack `@SolaceListener`'s handler runs on a
+per-listener thread pool, off the JCSMP dispatch thread ([§3.5](#35-acknowledgements)). Left
+unbounded, a handler that cannot keep up with delivery does not slow the broker down at all — every
+request keeps landing in this process's heap as a queued task holding the raw message, with nothing
+to bound how far that grows.
+
+`replier.backpressure.*` bounds that handoff queue and, once it fills to `pause-at-queue-depth`,
+pauses the listener's own flow(s) so the backlog accumulates on the broker's durable queue instead —
+visible, monitored, and already governed by `replier.provision.max-redelivery` and the DMQ
+([§3.6](#36-dead-message-queues)) — rather than invisibly in this process's memory. Delivery resumes
+once the backlog drains to `resume-at-queue-depth`. A message that still arrives after the queue is
+genuinely full (the broker's in-flight window did not drain in time to see the pause) is settled
+`FAILED` — the same active-redelivery mechanism [§3.4](#34-ttls-redeliveries-and-timeouts) covers —
+rather than accepted unconditionally. `AUTO`-ack listeners are unaffected: their handler already
+runs inline on the dispatch thread, which is self-throttling by construction.
+
+| Property | Default | Meaning |
+|---|---|---|
+| `request.max-pending` | `0` (unbounded) | Cap on concurrent in-flight `sendAndReceive` calls. Over the cap, fails fast with `RequestBackpressureException`. |
+| `request.reaper-sweep-interval` | `100ms` | How often the timeout reaper checks the correlation store for expired requests. Lower = faster failure, more frequent scanning. |
+| `request.reaper-max-staleness` | `5s` | How long the reaper's last sweep may go stale before `/actuator/health` reports the reply path DOWN — see below. |
+| `replier.backpressure.enabled` | `true` | Master switch for the handler-queue bound and flow pause/resume, for `CLIENT`-ack listeners. |
+| `replier.backpressure.queue-capacity` | `0` → `2 × concurrency` | Hard cap on the handoff queue. A message rejected past this is settled `FAILED`. |
+| `replier.backpressure.pause-at-queue-depth` | `0` → `queue-capacity` | Queue depth at which this listener's flow(s) pause. |
+| `replier.backpressure.resume-at-queue-depth` | `0` → `queue-capacity / 2` | Queue depth at which paused flow(s) resume. |
+
+```yaml
+solace:
+  request-reply:
+    request:
+      max-pending: 500              # 0 = unbounded (default)
+    replier:
+      backpressure:
+        enabled: true
+        queue-capacity: 0            # <=0 => 2 * concurrency
+        pause-at-queue-depth: 0      # <=0 => queue-capacity
+        resume-at-queue-depth: 0     # <=0 => queue-capacity / 2
+```
+
+**Observability.** `GET /actuator/health` reports `pendingRequests` and `reaperHealthy` under the
+reply-path indicator, and per-listener `queueDepth`/`backpressureEngaged` under the session
+indicator (§6). A listener pausing under load is expected, deliberate control flow, not a fault, so
+it is reported as a detail rather than flipping the indicator DOWN — only a reaper that has stopped
+sweeping altogether (past `request.reaper-max-staleness`) does that, since a correlation store that
+has stopped bounding itself is exactly the failure this whole mechanism exists to prevent, only
+silent instead of observable.
+
 ---
 
 ## 4. Configuration
@@ -427,6 +537,7 @@ A handful of settings are worth deciding deliberately rather than leaving at the
 
 | Setting | Default | Why it matters |
 |---|---|---|
+| `enabled` | `true` | Master switch for the whole library. `false` creates none of its beans — no session wiring beyond what `solace-java-spring-boot-starter` itself does, no listeners, no `ReplyingSolaceTemplate`. |
 | `reply.enabled` | `true` | Set `false` on a replier-only process — see [§3.3](#33-request-queues-vs-reply-queues). |
 | `reply.instance-id` | hostname | Must be unique per instance and stable across restarts — see [§3.3](#33-request-queues-vs-reply-queues). |
 | `request.ttl-matches-timeout` | `true` | Bounds how long an undelivered request can wait — see [§3.4](#34-ttls-redeliveries-and-timeouts). |
@@ -434,6 +545,8 @@ A handful of settings are worth deciding deliberately rather than leaving at the
 | `java.reconnect-retries` | — | Set to at least 100 with a 3000&nbsp;ms wait, giving the 300 seconds needed to survive an HA failover. The commonly copied value of 20 only gives 60 seconds. |
 | `dmq.enabled` | `true` | Turning it off restores silent discard of failed messages — see [§3.6](#36-dead-message-queues). |
 | `replier.reply-ttl` | follows `request.timeout` | Set `0s` to keep replies forever, at the cost of orphaned queues growing — see [§3.4](#34-ttls-redeliveries-and-timeouts). |
+| `replier.backpressure.enabled` | `true` | Bounds a `CLIENT`-ack listener's handoff queue and pauses its flow(s) under load instead of buffering unbounded work in memory — see [§3.7](#37-backpressure). |
+| `request.max-pending` | `0` (unbounded) | Caps concurrent in-flight `sendAndReceive` calls; over the cap fails fast with `RequestBackpressureException` — see [§3.7](#37-backpressure). |
 
 `replier.provision.mode` and `reply.provision-mode` each accept two values:
 
@@ -500,7 +613,7 @@ part of the library's own API surface, which is `ReplyingSolaceTemplate` and `@S
 | `POST /api/bookings` with `"simulate"` | `timeout`, `remote-error` or `slow-handler`, to reproduce each failure mode |
 | `GET /api/diagnostics/endpoints` | what was actually provisioned, rather than what was configured |
 | `GET /api/diagnostics/reply-path` | whether this instance's reply path is bound and subscribed |
-| `GET /actuator/health` | session and endpoint state |
+| `GET /actuator/health` | session and endpoint state, including pending-request count, reaper health, and per-listener backlog ([§3.7](#37-backpressure)) |
 
 ---
 

@@ -3,6 +3,7 @@ package com.solace.samples.requestreply.listener;
 import com.solace.samples.requestreply.api.RequestReplyMessage;
 import com.solace.samples.requestreply.api.RetryableHandlerException;
 import com.solace.samples.requestreply.api.SolaceListenerErrorHandler;
+import com.solace.samples.requestreply.config.SolaceRequestReplyProperties;
 import com.solace.samples.requestreply.core.PayloadCodec;
 import com.solace.samples.requestreply.endpoint.RequestQueueProvisioner;
 import com.solace.samples.requestreply.transport.FlowConsumer;
@@ -20,9 +21,12 @@ import org.slf4j.LoggerFactory;
 import java.lang.reflect.InvocationTargetException;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
@@ -72,6 +76,24 @@ import java.util.concurrent.atomic.AtomicInteger;
  * see {@link #settleFailed} for where this is made explicit rather than silently swallowed. AUTO
  * fits a fast handler that does not reply and can tolerate an occasional failure going unnoticed;
  * CLIENT is the right choice for everything else.
+ *
+ * <h2>Backpressure</h2>
+ * {@code Executors.newFixedThreadPool} — what this container's handler pool used to be built
+ * from unconditionally — backs onto an <em>unbounded</em> queue. A handler that cannot keep up
+ * with broker delivery did not slow delivery down at all: every request kept landing in this
+ * process's heap as a queued {@code Runnable} holding the raw message, with nothing to bound how
+ * far that grew. For a {@code CLIENT}-ack listener (the only one whose handler runs on this
+ * pool — see above), this container now bounds that queue via
+ * {@code replier.backpressure.queue-capacity} and, once it reaches
+ * {@code pause-at-queue-depth}, pauses this listener's own flow(s) via {@link FlowConsumer#pause}
+ * so the backlog accumulates on the broker's durable queue instead — visible, monitored, and
+ * already governed by {@code replier.provision.max-redelivery} and the DMQ — rather than
+ * invisibly in this process's memory. Delivery resumes at {@code resume-at-queue-depth}. A
+ * message that still arrives after the queue is genuinely full (the broker's in-flight window did
+ * not drain in time to see the pause) is settled {@code FAILED} in {@link #onRejected} rather than
+ * accepted unconditionally, so it redelivers instead of piling up regardless. {@code AUTO}-ack
+ * listeners are unaffected: their handler already runs inline on the dispatch thread, which is
+ * self-throttling by construction.
  */
 public class SolaceMessageListenerContainer implements AutoCloseable {
 
@@ -87,11 +109,13 @@ public class SolaceMessageListenerContainer implements AutoCloseable {
     private final boolean replyDmqEligible;
     /** Resolved once at construction, not per message: "unset" already means request.timeout. */
     private final long replyTtlMillis;
+    private final SolaceRequestReplyProperties.Backpressure.Resolved backpressure;
 
     private final List<FlowConsumer> flows = new ArrayList<>();
+    private final AtomicBoolean backpressureEngaged = new AtomicBoolean();
     private volatile Queue queue;
     private volatile boolean running;
-    private volatile ExecutorService handlerExecutor;
+    private volatile ThreadPoolExecutor handlerExecutor;
 
     public SolaceMessageListenerContainer(SolaceListenerEndpoint endpoint,
                                           SolaceSession session,
@@ -101,7 +125,8 @@ public class SolaceMessageListenerContainer implements AutoCloseable {
                                           HandlerMethodInvoker invoker,
                                           SolaceListenerErrorHandler errorHandler,
                                           boolean replyDmqEligible,
-                                          long replyTtlMillis) {
+                                          long replyTtlMillis,
+                                          SolaceRequestReplyProperties.Backpressure.Resolved backpressure) {
         this.endpoint = endpoint;
         this.session = session;
         this.provisioner = provisioner;
@@ -111,13 +136,14 @@ public class SolaceMessageListenerContainer implements AutoCloseable {
         this.errorHandler = errorHandler;
         this.replyDmqEligible = replyDmqEligible;
         this.replyTtlMillis = replyTtlMillis;
+        this.backpressure = backpressure;
     }
 
     public synchronized void start() {
         if (running) { return; }
         queue = provisioner.ensure(endpoint.queue(), endpoint.topics());
         int n = Math.max(1, endpoint.concurrency());
-        handlerExecutor = Executors.newFixedThreadPool(n, named("rr-handler-" + endpoint.id() + "-"));
+        handlerExecutor = newHandlerExecutor(n);
         for (int i = 0; i < endpoint.concurrency(); i++) {
             FlowConsumer flow = new FlowConsumer(session, queue,
                     endpoint.id() + "-" + i, endpoint.clientAck(), this::onRequest);
@@ -126,8 +152,31 @@ public class SolaceMessageListenerContainer implements AutoCloseable {
         }
         session.onReconnect(this::onReconnect);
         running = true;
-        log.info("Listener '{}' started: queue={} concurrency={} topics={}",
-                endpoint.id(), endpoint.queue(), endpoint.concurrency(), endpoint.topics());
+        log.info("Listener '{}' started: queue={} concurrency={} topics={} backpressure={}",
+                endpoint.id(), endpoint.queue(), endpoint.concurrency(), endpoint.topics(),
+                endpoint.clientAck() && backpressure.enabled()
+                        ? "capacity=" + backpressure.queueCapacity()
+                                + " pauseAt=" + backpressure.pauseAtQueueDepth()
+                                + " resumeAt=" + backpressure.resumeAtQueueDepth()
+                        : "disabled");
+    }
+
+    /**
+     * A {@code CLIENT}-ack listener with backpressure enabled gets a bounded queue and a handler
+     * that settles a rejected message {@code FAILED} instead of buffering it unconditionally.
+     * Everything else (backpressure disabled, or {@code AUTO}-ack, whose handler never touches
+     * this pool at all — see {@link #onRequest}) keeps the original unbounded queue, matching
+     * prior behaviour exactly.
+     */
+    private ThreadPoolExecutor newHandlerExecutor(int n) {
+        ThreadFactory threadFactory = named("rr-handler-" + endpoint.id() + "-");
+        if (!endpoint.clientAck() || !backpressure.enabled()) {
+            return new ThreadPoolExecutor(n, n, 0L, TimeUnit.MILLISECONDS,
+                    new LinkedBlockingQueue<>(), threadFactory);
+        }
+        return new ThreadPoolExecutor(n, n, 0L, TimeUnit.MILLISECONDS,
+                new ArrayBlockingQueue<>(backpressure.queueCapacity()), threadFactory,
+                this::onRejected);
     }
 
     private static ThreadFactory named(String prefix) {
@@ -165,7 +214,7 @@ public class SolaceMessageListenerContainer implements AutoCloseable {
             handle(raw);
             return;
         }
-        ExecutorService pool = handlerExecutor;
+        ThreadPoolExecutor pool = handlerExecutor;
         if (pool == null) {
             // Only reachable while shutting down: close() nulls this before the flow that
             // delivered raw has necessarily stopped. Not acknowledging is correct here — the
@@ -174,7 +223,80 @@ public class SolaceMessageListenerContainer implements AutoCloseable {
                     + "redelivered", endpoint.id(), raw.getCorrelationId());
             return;
         }
-        pool.execute(() -> handle(raw));
+        pool.execute(new HandleTask(raw));
+        // Checked after handing off, not before: the depth that matters for the pause decision
+        // is the one left behind by this submission, and reading it any earlier would race the
+        // increment execute() just performed.
+        maybePause(pool);
+    }
+
+    /**
+     * Wraps the unit of work so the rejection handler ({@link #onRejected}) can recover the
+     * original message when the queue is full. A bare {@code () -> handle(raw)} lambda would
+     * reach that handler as an opaque {@code Runnable} with no way back to {@code raw}.
+     */
+    private final class HandleTask implements Runnable {
+        private final BytesXMLMessage raw;
+
+        HandleTask(BytesXMLMessage raw) { this.raw = raw; }
+
+        @Override
+        public void run() {
+            try {
+                handle(raw);
+            } finally {
+                // Checked on the way out of every task, success or failure, so a backlog that
+                // drains because handlers are keeping up (not because messages stopped arriving)
+                // still resumes a paused flow promptly instead of only being noticed while a new
+                // request happens to arrive.
+                ThreadPoolExecutor pool = handlerExecutor;
+                if (pool != null) { maybeResume(pool); }
+            }
+        }
+    }
+
+    /** Pauses this listener's flow(s) once the handoff queue reaches its pause threshold. */
+    private void maybePause(ThreadPoolExecutor pool) {
+        if (!endpoint.clientAck() || !backpressure.enabled()) { return; }
+        int depth = pool.getQueue().size() + pool.getActiveCount();
+        if (depth >= backpressure.pauseAtQueueDepth() && backpressureEngaged.compareAndSet(false, true)) {
+            log.warn("Listener '{}' handler backlog reached {} (pause threshold {}); pausing flow "
+                    + "delivery until it drains to {} rather than buffering further requests in "
+                    + "memory", endpoint.id(), depth, backpressure.pauseAtQueueDepth(),
+                    backpressure.resumeAtQueueDepth());
+            flows.forEach(FlowConsumer::pause);
+        }
+    }
+
+    /** Resumes this listener's flow(s) once the handoff queue drains to its resume threshold. */
+    private void maybeResume(ThreadPoolExecutor pool) {
+        if (!backpressureEngaged.get()) { return; }
+        int depth = pool.getQueue().size() + pool.getActiveCount();
+        if (depth <= backpressure.resumeAtQueueDepth() && backpressureEngaged.compareAndSet(true, false)) {
+            log.info("Listener '{}' handler backlog drained to {}; resuming flow delivery",
+                    endpoint.id(), depth);
+            flows.forEach(FlowConsumer::resume);
+        }
+    }
+
+    /**
+     * A message that still arrived after the handoff queue was already full — the broker's
+     * in-flight window did not drain in time to see {@link #maybePause} take effect — is settled
+     * {@code FAILED} rather than accepted unconditionally. That forces a redelivery, subject to
+     * {@code replier.provision.max-redelivery} and the DMQ, instead of this process buffering
+     * unbounded work in memory regardless of the pool's own capacity.
+     */
+    private void onRejected(Runnable task, ThreadPoolExecutor pool) {
+        if (task instanceof HandleTask t) {
+            log.warn("Listener '{}' handler queue is full (capacity={}); settling "
+                    + "correlationId={} FAILED so the broker redelivers it instead of this "
+                    + "process buffering unbounded work in memory", endpoint.id(),
+                    backpressure.queueCapacity(), t.raw.getCorrelationId());
+            settleFailed(t.raw, t.raw.getCorrelationId());
+        } else {
+            log.warn("Listener '{}' handler queue is full; discarding an internal task",
+                    endpoint.id());
+        }
     }
 
     /**
@@ -348,6 +470,15 @@ public class SolaceMessageListenerContainer implements AutoCloseable {
 
     public String id() { return endpoint.id(); }
 
+    /** Requests queued plus running in the handler pool, or {@code 0} before {@link #start()}. */
+    public int queueDepth() {
+        ThreadPoolExecutor pool = handlerExecutor;
+        return pool == null ? 0 : pool.getQueue().size() + pool.getActiveCount();
+    }
+
+    /** Whether this listener's flow(s) are currently paused for backpressure. */
+    public boolean isBackpressureEngaged() { return backpressureEngaged.get(); }
+
     @Override
     public synchronized void close() {
         running = false;
@@ -355,7 +486,7 @@ public class SolaceMessageListenerContainer implements AutoCloseable {
         flows.clear();
         // Null before shutdown: a concurrent onRequest reads this field, and it must never see a
         // pool that has already stopped accepting work.
-        ExecutorService pool = handlerExecutor;
+        ThreadPoolExecutor pool = handlerExecutor;
         handlerExecutor = null;
         if (pool != null) { pool.shutdown(); }
     }

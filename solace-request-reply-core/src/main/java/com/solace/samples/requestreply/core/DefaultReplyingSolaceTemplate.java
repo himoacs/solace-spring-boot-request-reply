@@ -6,6 +6,7 @@ import com.solace.samples.requestreply.api.RequestReplyMessage;
 import com.solace.samples.requestreply.config.SolaceRequestReplyProperties;
 import com.solace.samples.requestreply.endpoint.ReplyEndpoint;
 import com.solace.samples.requestreply.exception.RemoteErrorException;
+import com.solace.samples.requestreply.exception.RequestBackpressureException;
 import com.solace.samples.requestreply.exception.RequestReplyException;
 import com.solace.samples.requestreply.exception.RequestTimeoutException;
 import com.solace.samples.requestreply.exception.TransportException;
@@ -24,7 +25,9 @@ import java.time.Duration;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Semaphore;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Function;
 
@@ -55,6 +58,14 @@ public class DefaultReplyingSolaceTemplate implements ReplyingSolaceTemplate, Au
 
     private final AtomicLong sequence = new AtomicLong();
     private final Map<String, Expression> replyPlaceholderExpressions = new java.util.LinkedHashMap<>();
+    /**
+     * Admission control for {@link #sendAndReceive}: {@code null} means
+     * {@code request.max-pending} is unset (unbounded, prior behaviour). Bounding this is what
+     * keeps a traffic burst from growing the correlation store to {@code arrivalRate * timeout}
+     * entries before {@link #reaper} catches up — see that field's Javadoc for the other half of
+     * this leak's story.
+     */
+    private final Semaphore admissionPermits;
 
     private volatile FlowConsumer replyFlow;
 
@@ -77,7 +88,10 @@ public class DefaultReplyingSolaceTemplate implements ReplyingSolaceTemplate, Au
                 replyPlaceholderExpressions.put(name, SPEL.parseExpression(spel));
             }
         });
-        this.reaper = new TimeoutReaper(store, 100, this::expire);
+        this.reaper = new TimeoutReaper(store,
+                props.getRequest().getReaperSweepInterval().toMillis(), this::expire);
+        int maxPending = props.getRequest().getMaxPending();
+        this.admissionPermits = maxPending > 0 ? new Semaphore(maxPending) : null;
     }
 
     // ---------------------------------------------------------------- lifecycle
@@ -118,6 +132,15 @@ public class DefaultReplyingSolaceTemplate implements ReplyingSolaceTemplate, Au
     public String replyTopicPattern() { return replyEndpoint.subscription(); }
 
     @Override
+    public int pendingRequestCount() { return store.size(); }
+
+    @Override
+    public long reaperLastSweepAgeMillis() {
+        long last = reaper.lastSweepEpochMs();
+        return last == 0 ? -1 : System.currentTimeMillis() - last;
+    }
+
+    @Override
     public Duration defaultReplyTimeout() { return props.getRequest().getTimeout(); }
 
     // ------------------------------------------------------------------ sending
@@ -150,6 +173,12 @@ public class DefaultReplyingSolaceTemplate implements ReplyingSolaceTemplate, Au
     public RequestReplyFuture<RequestReplyMessage> sendAndReceive(String topic,
                                                                   RequestReplyMessage request,
                                                                   Duration timeout) {
+        // Checked before anything else is built: a rejected request should cost nothing beyond
+        // this check, not a correlation id, a topic lookup and a registered future that then has
+        // to be torn down again.
+        if (admissionPermits != null && !admissionPermits.tryAcquire()) {
+            return rejectedByBackpressure(topic);
+        }
         long startNanos = System.nanoTime();
         String correlationId = request.getCorrelationId() != null
                 ? request.getCorrelationId() : UUID.randomUUID().toString();
@@ -188,6 +217,17 @@ public class DefaultReplyingSolaceTemplate implements ReplyingSolaceTemplate, Au
     }
 
 
+    /** Fails fast: {@code request.max-pending} in-flight requests are already registered. */
+    private RequestReplyFuture<RequestReplyMessage> rejectedByBackpressure(String topic) {
+        int maxPending = props.getRequest().getMaxPending();
+        RequestBackpressureException ex = new RequestBackpressureException(topic, maxPending);
+        log.warn(ex.getMessage());
+        RequestReplyFuture<RequestReplyMessage> rejected =
+                new RequestReplyFuture<>(CompletableFuture.failedFuture(ex));
+        rejected.completeExceptionally(ex);
+        return rejected;
+    }
+
     private Map<String, String> perRequestPlaceholderValues(RequestReplyMessage request) {
         Map<String, String> out = new HashMap<>();
         for (String name : props.getReply().getPerRequestPlaceholders()) {
@@ -216,17 +256,21 @@ public class DefaultReplyingSolaceTemplate implements ReplyingSolaceTemplate, Au
         RequestReplyMessage reply = InboundMessage.toModel(msg);
         String correlationId = reply.getCorrelationId();
 
-        store.remove(correlationId).ifPresentOrElse(pending ->
-                // Off the dispatch thread: completing here would run every dependent stage of
-                // the caller's future on JCSMP's, stalling delivery for every other reply.
-                completionExecutor.execute(() -> {
-                    if (reply.isError()) {
-                        pending.getFuture().completeExceptionally(
-                                new RemoteErrorException(correlationId, reply.getErrorMessage()));
-                    } else {
-                        pending.getFuture().complete(reply);
-                    }
-                }),
+        store.remove(correlationId).ifPresentOrElse(pending -> {
+                    // The request is no longer in flight the instant ownership transfers, whether
+                    // or not the completion below has actually run yet.
+                    releasePermit();
+                    // Off the dispatch thread: completing here would run every dependent stage of
+                    // the caller's future on JCSMP's, stalling delivery for every other reply.
+                    completionExecutor.execute(() -> {
+                        if (reply.isError()) {
+                            pending.getFuture().completeExceptionally(
+                                    new RemoteErrorException(correlationId, reply.getErrorMessage()));
+                        } else {
+                            pending.getFuture().complete(reply);
+                        }
+                    });
+                },
                 () -> log.debug("Uncorrelated reply correlationId={} — already timed out, a "
                         + "duplicate, or addressed to a previous incarnation of this instance",
                         correlationId));
@@ -238,8 +282,15 @@ public class DefaultReplyingSolaceTemplate implements ReplyingSolaceTemplate, Au
                 Duration.ofMillis(pending.getTimeoutMs())));
     }
 
+    /** Every caller already owns {@code pending} via a successful {@code store.remove}. */
     private void completeExceptionally(PendingRequest pending, Throwable cause) {
+        releasePermit();
         completionExecutor.execute(() -> pending.getFuture().completeExceptionally(cause));
+    }
+
+    /** Returns the admission permit {@code pending} held, if admission control is enabled. */
+    private void releasePermit() {
+        if (admissionPermits != null) { admissionPermits.release(); }
     }
 
     /** Preserves the send future while mapping the reply payload. */

@@ -58,6 +58,35 @@ public class SolaceRequestReplyProperties {
          * correct on both. It does nothing at all unless the DMQ exists — see {@link Dmq}.
          */
         private boolean dmqEligible = true;
+        /**
+         * Caps concurrent in-flight {@code sendAndReceive} calls on this instance. {@code 0}
+         * (the default) is unbounded, matching prior behaviour.
+         *
+         * <p>Without a cap, a traffic burst or a stalled replier grows the correlation store to
+         * roughly {@code arrivalRate * timeout} entries before the timeout reaper catches up —
+         * accepted silently, with no signal to the caller that it should slow down. Setting this
+         * turns that into a fast, typed {@code RequestBackpressureException} the moment the cap
+         * is hit, instead of an ever-growing map of futures waiting on a reply that may never
+         * come.
+         */
+        private int maxPending = 0;
+        /**
+         * How often {@link com.solace.samples.requestreply.core.TimeoutReaper} sweeps the
+         * correlation store for expired requests. Lower values fail expired requests sooner, at
+         * the cost of copying the store's pending entries more often.
+         */
+        private Duration reaperSweepInterval = Duration.ofMillis(100);
+        /**
+         * How stale the reaper's last successful sweep may get before the reply path reports
+         * itself unhealthy. Should be a small multiple of {@link #reaperSweepInterval}.
+         *
+         * <p>The reaper runs on a {@code scheduleWithFixedDelay} task, whose documented
+         * behaviour is to stop forever, silently, the first time the task throws. From that
+         * moment every future request leaks its {@code CompletableFuture} and its correlation
+         * store entry for the life of the process, because nothing else ever evicts it. This
+         * threshold is what turns that silent failure into an observable one.
+         */
+        private Duration reaperMaxStaleness = Duration.ofSeconds(5);
 
         public Duration getTimeout() { return timeout; }
         public void setTimeout(Duration v) { this.timeout = v; }
@@ -67,6 +96,12 @@ public class SolaceRequestReplyProperties {
         public void setSequenceNumbers(boolean v) { this.sequenceNumbers = v; }
         public boolean isDmqEligible() { return dmqEligible; }
         public void setDmqEligible(boolean v) { this.dmqEligible = v; }
+        public int getMaxPending() { return maxPending; }
+        public void setMaxPending(int v) { this.maxPending = v; }
+        public Duration getReaperSweepInterval() { return reaperSweepInterval; }
+        public void setReaperSweepInterval(Duration v) { this.reaperSweepInterval = v; }
+        public Duration getReaperMaxStaleness() { return reaperMaxStaleness; }
+        public void setReaperMaxStaleness(Duration v) { this.reaperMaxStaleness = v; }
     }
 
     // -------------------------------------------------------------------- reply
@@ -237,6 +272,8 @@ public class SolaceRequestReplyProperties {
 
         @NestedConfigurationProperty
         private final Provision provision = new Provision();
+        @NestedConfigurationProperty
+        private final Backpressure backpressure = new Backpressure();
 
         public String getQueue() { return queue; }
         public void setQueue(String v) { this.queue = v; }
@@ -251,11 +288,63 @@ public class SolaceRequestReplyProperties {
         public void setDmqEligible(boolean v) { this.dmqEligible = v; }
         public Duration getReplyTtl() { return replyTtl; }
         public void setReplyTtl(Duration v) { this.replyTtl = v; }
+        public Backpressure getBackpressure() { return backpressure; }
 
         /** Reply TTL in millis, resolving "unset" against the request timeout. */
         public long resolveReplyTtlMillis(Duration requestTimeout) {
             Duration d = replyTtl != null ? replyTtl : requestTimeout;
             return d == null || d.isNegative() ? 0L : d.toMillis();
+        }
+    }
+
+    /**
+     * Bounds the in-process handoff between a {@code CLIENT}-ack listener's flow(s) and its
+     * handler pool.
+     *
+     * <p>{@code Executors.newFixedThreadPool} backs onto an <em>unbounded</em> queue. Left alone,
+     * a handler that cannot keep up with broker delivery does not slow the broker down at all —
+     * every request keeps landing in this process's heap as a queued {@code Runnable} holding the
+     * raw message, growing without limit. This bounds that queue and, once it fills to
+     * {@link #pauseAtQueueDepth}, pauses the listener's own flow(s) so the backlog accumulates on
+     * the broker's durable queue instead — visible, monitored, and already governed by
+     * {@code replier.provision.max-redelivery} and the DMQ — rather than invisibly in this
+     * process's memory. Delivery resumes once the backlog drains to {@link #resumeAtQueueDepth}.
+     *
+     * <p>A message that arrives after the queue is already full (the broker's in-flight window
+     * did not drain in time to see the pause) is settled {@code FAILED} rather than accepted
+     * unconditionally, so it redelivers instead of piling up regardless.
+     */
+    public static class Backpressure {
+        private boolean enabled = true;
+        /** {@code <= 0} resolves to {@code 2 * concurrency} for that listener. */
+        private int queueCapacity = 0;
+        /** {@code <= 0} resolves to {@link #queueCapacity} — pause once the buffer is full. */
+        private int pauseAtQueueDepth = 0;
+        /** {@code <= 0} resolves to half of the resolved {@link #queueCapacity}. */
+        private int resumeAtQueueDepth = 0;
+
+        public boolean isEnabled() { return enabled; }
+        public void setEnabled(boolean v) { this.enabled = v; }
+        public int getQueueCapacity() { return queueCapacity; }
+        public void setQueueCapacity(int v) { this.queueCapacity = v; }
+        public int getPauseAtQueueDepth() { return pauseAtQueueDepth; }
+        public void setPauseAtQueueDepth(int v) { this.pauseAtQueueDepth = v; }
+        public int getResumeAtQueueDepth() { return resumeAtQueueDepth; }
+        public void setResumeAtQueueDepth(int v) { this.resumeAtQueueDepth = v; }
+
+        /** Resolves every {@code <= 0} ("auto") value against one listener's own concurrency. */
+        public Resolved resolve(int concurrency) {
+            int capacity = queueCapacity > 0 ? queueCapacity : Math.max(1, concurrency * 2);
+            int pauseAt = pauseAtQueueDepth > 0 ? Math.min(pauseAtQueueDepth, capacity) : capacity;
+            int resumeAt = resumeAtQueueDepth > 0
+                    ? Math.min(resumeAtQueueDepth, pauseAt)
+                    : Math.max(1, capacity / 2);
+            return new Resolved(enabled, capacity, pauseAt, resumeAt);
+        }
+
+        /** Fully resolved settings for one listener; no more {@code <= 0} "auto" values. */
+        public record Resolved(boolean enabled, int queueCapacity, int pauseAtQueueDepth,
+                               int resumeAtQueueDepth) {
         }
     }
 

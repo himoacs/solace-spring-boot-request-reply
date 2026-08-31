@@ -159,8 +159,10 @@ public class SolaceRequestReplyAutoConfiguration {
     @ConditionalOnProperty(prefix = "solace.request-reply.reply", name = "enabled",
             havingValue = "true", matchIfMissing = true)
     public ReplyPathHealthIndicator solaceReplyPathHealthIndicator(
-            SolaceSession session, ReplyEndpoint replyEndpoint) {
-        return new ReplyPathHealthIndicator(session, replyEndpoint);
+            SolaceSession session, ReplyEndpoint replyEndpoint, ReplyingSolaceTemplate template,
+            SolaceRequestReplyProperties props) {
+        return new ReplyPathHealthIndicator(session, replyEndpoint, template,
+                props.getRequest().getReaperMaxStaleness().toMillis());
     }
 
     /**
@@ -295,7 +297,8 @@ public class SolaceRequestReplyAutoConfiguration {
                         endpoint, session, provisioner, publisher, codec, invoker,
                         resolveErrorHandler(endpoint),
                         props.getDmq().isEnabled() && props.getReplier().isDmqEligible(),
-                        props.getReplier().resolveReplyTtlMillis(props.getRequest().getTimeout()));
+                        props.getReplier().resolveReplyTtlMillis(props.getRequest().getTimeout()),
+                        props.getReplier().getBackpressure().resolve(endpoint.concurrency()));
                 container.start();
                 containers.add(container);
             }
